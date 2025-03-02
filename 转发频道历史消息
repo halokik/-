@@ -1,0 +1,101 @@
+from telethon import TelegramClient, events
+import asyncio
+from collections import defaultdict
+
+API_ID = 21332425
+API_HASH = 'f5d0cddc784e3a7a09ea9714ed01f238'
+
+# 创建客户端
+client = TelegramClient('user_session', API_ID, API_HASH)
+
+# 设置来源群和目标群
+SOURCE_CHANNEL = -1001792237267  # 替换为来源群ID
+TARGET_CHANNEL = -1002306822335  # 替换为目标群ID
+
+async def copy_messages(start_id, end_id):
+    # 确保客户端已连接
+    await client.start()
+    
+    try:
+        processed = 0
+        current_album = None
+        album_messages = defaultdict(list)
+        
+        # 按顺序获取消息
+        async for message in client.iter_messages(SOURCE_CHANNEL, min_id=start_id-1, max_id=end_id+1, reverse=True):
+            try:
+                if message.grouped_id:
+                    # 如果是相册消息，先收集
+                    album_messages[message.grouped_id].append(message)
+                    
+                    # 检查是否是相册的最后一条消息
+                    next_message = await client.get_messages(SOURCE_CHANNEL, ids=message.id + 1)
+                    is_last_in_album = not next_message or next_message.grouped_id != message.grouped_id
+                    
+                    if is_last_in_album:
+                        # 发送整个相册
+                        album = album_messages[message.grouped_id]
+                        album.sort(key=lambda x: x.id)  # 确保顺序正确
+                        
+                        files = []
+                        caption = None
+                        for msg in album:
+                            if msg.media:
+                                files.append(msg.media)
+                            if msg.text and not caption:  # 使用第一条带文本的消息作为说明文字
+                                caption = msg.text
+                        
+                        if files:
+                            await client.send_file(
+                                TARGET_CHANNEL,
+                                files,
+                                caption=caption
+                            )
+                            processed += len(album)
+                            print(f"已复制相册 (ID: {message.id}), 包含 {len(album)} 条消息")
+                            await asyncio.sleep(2)
+                        
+                        # 清理已发送的相册消息
+                        del album_messages[message.grouped_id]
+                else:
+                    # 处理普通消息
+                    if message.media:
+                        await client.send_file(
+                            TARGET_CHANNEL,
+                            message.media,
+                            caption=message.text if message.text else None
+                        )
+                    elif message.text:
+                        await client.send_message(
+                            TARGET_CHANNEL,
+                            message.text
+                        )
+                    
+                    processed += 1
+                    print(f"已复制消息 (ID: {message.id})")
+                    await asyncio.sleep(2)
+                
+            except Exception as e:
+                print(f"复制消息时出错 (ID: {message.id}): {str(e)}")
+                continue
+        
+        print("\n复制完成！")
+        print(f"总共处理了 {processed} 条消息")
+        
+    except Exception as e:
+        print(f"发生错误: {str(e)}")
+    finally:
+        await client.disconnect()
+
+async def main():
+    # 获取用户输入
+    print("请输入要复制的消息范围：")
+    start_id = int(input("起始消息ID: "))
+    end_id = int(input("结束消息ID: "))
+    
+    print(f"\n开始复制从 {start_id} 到 {end_id} 的消息...")
+    await copy_messages(start_id, end_id)
+
+# 运行主程序
+if __name__ == '__main__':
+    asyncio.run(main())
