@@ -1,0 +1,354 @@
+from telethon import TelegramClient, events, Button
+import asyncio
+import re
+from telethon.tl.types import Channel
+import json
+import os
+import time
+
+# Telegram API凭据
+API_ID = 21332425
+API_HASH = 'f5d0cddc784e3a7a09ea9714ed01f238'
+BOT_TOKEN = '8010588495:AAGiJj8Kq3icsamdySZ1LkH9sgLdmLGmUbw'
+
+# 转发设置
+CONCURRENT_LIMIT = 5      # 降低并发数到5以避免超过限制
+ALBUM_DELAY = 0.2        # 相册发送后延迟时间（秒）
+MESSAGE_DELAY = 0.035    # 单条消息发送后延迟时间（秒）：1/30 ≈ 0.033，稍微加一点余量
+BATCH_SIZE = 200         # 每批处理200条消息
+PROGRESS_UPDATE = 2      # 每2秒更新一次进度
+
+# 创建机器人客户端实例
+bot = TelegramClient('bot_session', API_ID, API_HASH)
+
+# 用户状态存储
+user_states = {}  # 可能的状态: "waiting_source", "waiting_target", "waiting_start_id", "waiting_end_id"
+# 频道配置存储
+channel_configs = {}
+
+# 保存和加载配置
+def save_configs():
+    with open('channel_configs.json', 'w', encoding='utf-8') as f:
+        json.dump(channel_configs, f)
+
+def load_configs():
+    global channel_configs
+    try:
+        if os.path.exists('channel_configs.json'):
+            with open('channel_configs.json', 'r', encoding='utf-8') as f:
+                channel_configs = json.load(f)
+    except Exception:
+        channel_configs = {}
+
+@bot.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    user_id = str(event.sender_id)
+    welcome_message = '欢迎使用频道转发机器人！\n'
+    
+    # 添加当前配置信息
+    if user_id in channel_configs:
+        source = channel_configs[user_id].get('source', '未设置')
+        target = channel_configs[user_id].get('target', '未设置')
+        welcome_message += f'\n当前配置：\n源频道: {source}\n目标频道: {target}\n'
+    
+    welcome_message += '\n请选择以下操作：'
+    
+    buttons = [
+        [Button.inline("设置源频道", b"set_source")],
+        [Button.inline("设置目标频道", b"set_target")]
+    ]
+    
+    # 如果源频道和目标频道都已设置，添加开始转发按钮
+    if user_id in channel_configs and 'source' in channel_configs[user_id] and 'target' in channel_configs[user_id]:
+        buttons.append([Button.inline("开始转发历史消息", b"start_forward")])
+    
+    await event.respond(welcome_message, buttons=buttons)
+
+@bot.on(events.CallbackQuery(pattern=b"set_source"))
+async def set_source_handler(event):
+    user_id = event.sender_id
+    user_states[user_id] = "waiting_source"
+    await event.respond("请发送源频道的用户名或链接（例如：@channel）")
+    await event.answer()
+
+@bot.on(events.CallbackQuery(pattern=b"set_target"))
+async def set_target_handler(event):
+    user_id = event.sender_id
+    user_states[user_id] = "waiting_target"
+    await event.respond("请发送目标频道的用户名链接（例如：@channel）")
+    await event.answer()
+
+@bot.on(events.NewMessage(pattern=r'(?:https?://t\.me/|@)?\w+'))
+async def handle_channel_setting(event):
+    user_id = event.sender_id
+    if user_id not in user_states or user_states[user_id] not in ["waiting_source", "waiting_target"]:
+        return  # 只处理等待设置频道的状态
+
+    channel_input = event.message.text.strip()
+    
+    # 处理不同格式的输入
+    if channel_input.startswith('https://t.me/'):
+        channel_username = '@' + channel_input.split('/')[-1]
+    elif not channel_input.startswith('@'):
+        channel_username = '@' + channel_input
+    else:
+        channel_username = channel_input
+
+    try:
+        # 获取频道实体
+        channel = await bot.get_entity(channel_username)
+        
+        if not isinstance(channel, Channel):
+            await event.respond("这不是一个有效的频道，请重新输入")
+            return
+
+        # 只对目标频道进行成员检查
+        if user_states[user_id] == "waiting_target":
+            try:
+                # 尝试发送一条测试消息到目标频道（之后会删除）
+                test_message = await bot.send_message(channel, "测试消息权限...")
+                await test_message.delete()  # 立即删除测试消息
+            except Exception as e:
+                await event.respond(f"请先将机器人添加到目标频道 {channel_username} 中，并确保机器人有发消息的权限")
+                return
+
+        # 保存配置
+        if user_states[user_id] == "waiting_source":
+            if str(user_id) not in channel_configs:
+                channel_configs[str(user_id)] = {}
+            channel_configs[str(user_id)]['source'] = channel_username
+            # 显示当前配置状态
+            source = channel_username
+            target = channel_configs[str(user_id)].get('target', '未设置')
+            await event.respond(f"源频道设置成功！\n\n当前配置：\n源频道: {source}\n目标频道: {target}")
+            
+        elif user_states[user_id] == "waiting_target":
+            if str(user_id) not in channel_configs:
+                channel_configs[str(user_id)] = {}
+            channel_configs[str(user_id)]['target'] = channel_username
+            # 显示当前配置状态
+            source = channel_configs[str(user_id)].get('source', '未设置')
+            target = channel_username
+            await event.respond(f"目标频道设置成功！\n\n当前配置：\n源频道: {source}\n目标频道: {target}")
+
+        # 如果源频道和目标频道都设置了，显示开始转发按钮
+        if str(user_id) in channel_configs and 'source' in channel_configs[str(user_id)] and 'target' in channel_configs[str(user_id)]:
+            source_channel = channel_configs[str(user_id)]['source']
+            target_channel = channel_configs[str(user_id)]['target']
+            config_message = (
+                "配置完成！当前设置：\n"
+                f"源频道: {source_channel}\n"
+                f"目标频道: {target_channel}\n"
+                "\n点击下面的按钮开始转发："
+            )
+            buttons = [[Button.inline("开始转发历史消息", b"start_forward")]]
+            await event.respond(config_message, buttons=buttons)
+
+        save_configs()
+        del user_states[user_id]
+
+    except Exception as e:
+        await event.respond(f"设置频道时发生错误：{str(e)}")
+        del user_states[user_id]
+
+@bot.on(events.CallbackQuery(pattern=b"start_forward"))
+async def start_forward_handler(event):
+    user_id = event.sender_id
+    user_states[user_id] = "waiting_start_id"
+    await event.respond("请输入起始消息ID或消息链接\n例如: `1` 或 `https://t.me/channel/1`")
+    await event.answer()
+
+@bot.on(events.NewMessage())
+async def handle_message_id(event):
+    user_id = event.sender_id
+    
+    # 忽略所有命令消息
+    if event.message.text.startswith('/'):
+        return
+        
+    if user_id not in user_states:
+        return
+    
+    if user_states[user_id] in ["waiting_start_id", "waiting_end_id"]:
+        # 处理消息ID输入
+        message_input = event.message.text.strip()
+        
+        # 解析输入（支持直接数字或链接格式）
+        if message_input.startswith('https://t.me/'):
+            pattern = r"https?://t\.me/([^/]+)/(\d+)"
+            match = re.match(pattern, message_input)
+            if not match:
+                await event.respond("请输入有效的消息ID或链接")
+                return
+            message_id = int(match.group(2))
+        else:
+            try:
+                message_id = int(message_input)
+            except ValueError:
+                await event.respond("请输入有效的消息ID或链接")
+                return
+
+        # 保存ID
+        if user_states[user_id] == "waiting_start_id":
+            if str(user_id) not in channel_configs:
+                channel_configs[str(user_id)] = {}
+            channel_configs[str(user_id)]['start_id'] = message_id
+            user_states[user_id] = "waiting_end_id"
+            await event.respond(f"起始消息ID设置为: {message_id}\n请输入结束消息ID或消息链接")
+        elif user_states[user_id] == "waiting_end_id":
+            channel_configs[str(user_id)]['end_id'] = message_id
+            # 先清除用户状态，再开始转发
+            del user_states[user_id]
+            await event.respond(f"结束消息ID设置为: {message_id}")
+            # 开始转发过程
+            await start_forwarding(event, user_id)
+        
+        save_configs()
+
+async def start_forwarding(event, user_id):
+    user_id = str(user_id)
+    source = channel_configs[user_id]['source']
+    target = channel_configs[user_id]['target']
+    start_id = channel_configs[user_id]['start_id']
+    end_id = channel_configs[user_id]['end_id']
+
+    try:
+        # 发送初始消息
+        progress_message = await event.respond("开始转发消息...")
+        source_channel = await bot.get_entity(source)
+        target_channel = await bot.get_entity(target)
+
+        # 确保开始ID小于结束ID
+        start_id, end_id = min(start_id, end_id), max(start_id, end_id)
+        total_messages = end_id - start_id + 1
+        
+        forwarded_count = 0
+        processed_count = 0  # 新增：已处理的消息ID数量
+        error_count = 0
+        semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+        
+        last_progress_time = 0   # 记录上次更新进度的时间
+        
+        # 进度更新函数
+        async def update_progress():
+            nonlocal last_progress_time, progress_message
+            current_time = time.time()
+            if current_time - last_progress_time >= PROGRESS_UPDATE:
+                progress = (processed_count / total_messages) * 100
+                progress_text = (
+                    f"进度：{progress:.1f}%\n"
+                    f"已转发 {forwarded_count} 条消息\n"
+                    f"错误 {error_count} 条"
+                )
+                
+                # 更新现有的进度消息而不是发送新消息
+                await progress_message.edit(progress_text)
+                    
+                last_progress_time = current_time
+
+        async def forward_message(message):
+            nonlocal forwarded_count, error_count, processed_count
+            async with semaphore:
+                try:
+                    if message.media:
+                        await bot.send_file(target_channel, message.media, caption=message.text)
+                    elif message.text:
+                        await bot.send_message(target_channel, message.text)
+                    forwarded_count += 1
+                    processed_count += 1  # 增加已处理消息ID计数
+                    await update_progress()
+                    await asyncio.sleep(MESSAGE_DELAY)
+                except Exception as e:
+                    error_count += 1
+                    processed_count += 1  # 即使出错也计入处理进度
+                    print(f"转发消息(ID:{message.id})时发生错误：{str(e)}")
+
+        async def forward_album(media_list, caption, group_id):
+            nonlocal forwarded_count, error_count, processed_count
+            async with semaphore:
+                try:
+                    await bot.send_file(target_channel, media_list, caption=caption)
+                    forwarded_count += len(media_list)
+                    processed_count += len(media_list)  # 增加已处理消息ID计数
+                    await update_progress()
+                    await asyncio.sleep(ALBUM_DELAY)
+                except Exception as e:
+                    error_count += 1
+                    processed_count += len(media_list)  # 即使出错也计入处理进度
+                    print(f"转发相册(ID:{group_id})时发生错误：{str(e)}")
+
+        for batch_start in range(start_id, end_id + 1, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE - 1, end_id)
+            try:
+                messages = await bot.get_messages(source_channel, ids=list(range(batch_start, batch_end + 1)))
+                valid_messages = [m for m in messages if m is not None]
+
+                # 按照媒体组分类消息
+                message_groups = {}
+                single_messages = []
+                tasks = []
+
+                for message in valid_messages:
+                    if message.grouped_id:
+                        if message.grouped_id not in message_groups:
+                            message_groups[message.grouped_id] = []
+                        message_groups[message.grouped_id].append(message)
+                    else:
+                        single_messages.append(message)
+
+                # 并发处理相册消息
+                for group_id, group_messages in message_groups.items():
+                    media_list = []
+                    caption = None
+                    for i, msg in enumerate(sorted(group_messages, key=lambda x: x.id)):
+                        if msg.media:
+                            media_list.append(msg.media)
+                            if i == 0 and msg.text:
+                                caption = msg.text
+                    if media_list:
+                        tasks.append(asyncio.create_task(forward_album(media_list, caption, group_id)))
+
+                # 并发处理单条消息
+                for message in single_messages:
+                    tasks.append(asyncio.create_task(forward_message(message)))
+
+                # 等待当前批次的所有任务完成
+                await asyncio.gather(*tasks)
+
+                # 更新批次完成后的进度
+                progress = (batch_end - start_id + 1) / total_messages * 100
+                await progress_message.edit(
+                    f"进度：{progress:.1f}%\n"
+                    f"已转发 {forwarded_count} 条消息\n"
+                    f"错误 {error_count} 条"
+                )
+
+            except Exception as e:
+                await progress_message.edit(f"处理批次 {batch_start}-{batch_end} 时发生错误：{str(e)}")
+                await asyncio.sleep(1)
+
+        # 发送完成消息
+        await progress_message.edit(
+            f"转发完成！\n"
+            f"成功转发 {forwarded_count} 条消息\n"
+            f"忽略 {error_count} 条"
+        )
+
+    except Exception as e:
+        if 'progress_message' in locals():
+            await progress_message.edit(f"转发过程中发生严重错误：{str(e)}")
+        else:
+            await event.respond(f"转发过程中发生严重错误：{str(e)}")
+        print(f"严重错误：{str(e)}")
+
+def main():
+    print("机器人已启动...")
+    # 加载配置
+    load_configs()
+    # 启动客户端
+    bot.start(bot_token=BOT_TOKEN)
+    # 运行机器人
+    bot.run_until_disconnected()
+
+if __name__ == '__main__':
+    main()
