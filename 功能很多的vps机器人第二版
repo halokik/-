@@ -7,11 +7,12 @@ import pathlib
 from typing import Dict
 import subprocess
 import json
+import re
 
 # 配置信息
 API_ID = 21332425
 API_HASH = 'f5d0cddc784e3a7a09ea9714ed01f238'
-BOT_TOKEN = '7258082736:AAEof4V0c7vGL5ZlOboQ-PKjZCuftB4Dzag'
+BOT_TOKEN = '7603780140:AAGml0QEyXvLdZjJfACU3licQO8PlSHBECs'
 
 # 允许使用机器人的用户ID列表
 ALLOWED_USERS = [5179399961,6279591488]
@@ -28,6 +29,8 @@ class UserState:
         self.current_path = None
         self.edit_file_path = None  # 用于存储正在编辑的文件路径
         self.docker_operation = None  # 记录当前的 docker 操作
+        self.waiting_search = False
+        self.search_type = None  # 'filename' 或 'content'
 
 # 在全局变量部分添加
 user_states: Dict[int, UserState] = {}
@@ -103,6 +106,12 @@ async def refresh_directory_view(event, current_path):
         operation_buttons.append(Button.inline('➕ 创建文件夹', f'mkdir:{current_path}'))
         operation_buttons.append(Button.inline('📝 创建文件', f'mkfile:{current_path}'))
         buttons.append(operation_buttons)
+        
+        # 添加搜索按钮
+        buttons.append([
+            Button.inline('🔍 搜索文件', f'search:{current_path}'),
+            Button.inline('📄 搜索内容', f'search_content:{current_path}')
+        ])
         
         # 添加返回上级按钮
         if str(path_obj) != '/':
@@ -523,7 +532,9 @@ async def handle_new_message(event):
         return
         
     try:
-        if user_state.waiting_proxy:
+        if user_state.waiting_search:
+            await handle_search(event, user_state)
+        elif user_state.waiting_proxy:
             await handle_proxy_message(event, user_state)
         elif user_state.waiting_mkdir:
             await handle_mkdir_message(event, user_state)
@@ -539,6 +550,8 @@ async def handle_new_message(event):
             user_state.waiting_mkdir = False
             user_state.waiting_mkfile = False 
             user_state.waiting_edit = False
+            user_state.waiting_search = False
+            user_state.search_type = None
             user_state.current_path = None
             user_state.edit_file_path = None
 
@@ -732,7 +745,7 @@ async def run_python_file(event):
         print(f"运行 Python 文件时发生错误: {str(e)}")
         await event.answer(f'❌ 运行失败: {str(e)}', alert=True)
 
-# 添加查看运行中的 Python 程序的处理函数
+# 修改 list_running_python 函数
 @bot.on(events.CallbackQuery(pattern='running_py'))
 async def list_running_python(event):
     """列出所有运行中的 Python 程序"""
@@ -740,37 +753,96 @@ async def list_running_python(event):
         return
     
     try:
-        # 使用两个命令来获取进程信息
-        ps_cmd = ['ps', '-ef']
-        ps_result = subprocess.run(ps_cmd, capture_output=True, text=True)
+        # 获取所有 Python 进程信息
+        ps_result = subprocess.run(['ps', '-eo', 'pid,etime,cmd'], capture_output=True, text=True)
         
         # 过滤并格式化进程信息
         running_programs = []
-        for line in ps_result.stdout.strip().split('\n'):
+        for line in ps_result.stdout.strip().split('\n')[1:]:  # 跳过标题行
             if 'python3' in line and 'bot_session' not in line:  # 排除机器人进程
-                parts = line.split()
-                if len(parts) >= 8:
-                    pid = parts[1]
-                    cmd = ' '.join(parts[7:])
-                    if '.py' in cmd:  # 只显示运行 Python 文件的进程
-                        running_programs.append((pid, cmd))
+                parts = line.strip().split(None, 2)
+                if len(parts) >= 3 and '.py' in parts[2]:  # 只显示运行 Python 文件的进程
+                    pid = parts[0]
+                    runtime = parts[1]
+                    cmd = parts[2]
+                    
+                    # 提取 Python 文件名
+                    py_file = next((part for part in cmd.split() if part.endswith('.py')), '')
+                    
+                    # 格式化运行时间
+                    if '-' in runtime:  # 如果包含天数
+                        days, time = runtime.split('-')
+                        runtime = f"{days}天 {time}"
+                    
+                    running_programs.append((pid, runtime, py_file, cmd))
         
         if running_programs:
             # 为每个进程创建停止按钮
             buttons = []
             message = '🔄 运行中的 Python 程序:\n\n'
-            for pid, cmd in running_programs:
-                message += f'🔹 PID: {pid}\n📄 命令: {cmd}\n\n'
-                buttons.append([Button.inline(f'⏹️ 停止 PID: {pid}', f'kill:{pid}')])
             
-            buttons.append([Button.inline('📂 返回文件浏览器', 'ls')])
+            for pid, runtime, py_file, cmd in running_programs:
+                # 格式化显示信息
+                message += f'📌 进程 ID: {pid}\n'
+                message += f'⏱️ 运行时间: {runtime}\n'
+                message += f'📄 文件: {py_file}\n'
+                message += f'💻 完整命令:\n`{cmd}`\n\n'
+                
+                # 添加操作按钮
+                buttons.append([
+                    Button.inline(f'⏹️ 停止 {py_file}', f'kill:{pid}'),
+                    Button.inline(f'📋 查看日志', f'view_log:{py_file}')
+                ])
+            
+            # 添加底部按钮
+            buttons.extend([
+                [Button.inline('🔄 刷新列表', 'running_py')],
+                [Button.inline('📂 返回文件浏览器', 'ls')]
+            ])
+            
             await event.edit(message, buttons=buttons)
         else:
-            buttons = [[Button.inline('📂 返回文件浏览器', 'ls')]]
+            buttons = [
+                [Button.inline('🔄 刷新列表', 'running_py')],
+                [Button.inline('📂 返回文件浏览器', 'ls')]
+            ]
             await event.edit('📝 当前没有运行中的 Python 程序', buttons=buttons)
             
     except Exception as e:
         print(f"获取运行中的 Python 程序时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+# 添加查看日志功能
+@bot.on(events.CallbackQuery(pattern=r'view_log:(.+)'))
+async def view_process_log(event):
+    """查看进程日志"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    py_file = event.pattern_match.group(1).decode()
+    log_file = f"{py_file}.log"
+    
+    try:
+        if os.path.exists(log_file):
+            # 读取最后 100 行日志
+            with open(log_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()[-100:]
+                content = ''.join(lines)
+            
+            # 如果内容太长，截断显示
+            if len(content) > 4000:
+                content = content[-4000:] + '\n... (日志已截断)'
+            
+            buttons = [[Button.inline('◀️ 返回进程列表', 'running_py')]]
+            await event.edit(
+                f'📋 {py_file} 的日志:\n\n```\n{content}\n```',
+                buttons=buttons
+            )
+        else:
+            await event.answer(f'❌ 找不到日志文件: {log_file}', alert=True)
+            
+    except Exception as e:
+        print(f"查看进程日志时发生错误: {str(e)}")
         await event.answer(f'❌ 错误: {str(e)}', alert=True)
 
 # 添加停止进程的处理函数
@@ -1120,6 +1192,189 @@ async def start_speed_test(event):
         
     except Exception as e:
         await event.edit(f'❌ 错误: {str(e)}')
+
+# 添加搜索相关的处理函数
+@bot.on(events.CallbackQuery(pattern=r'search:(.+)'))
+async def search_file_start(event):
+    """开始文件搜索流程"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    path = event.pattern_match.group(1).decode()
+    
+    # 保存用户状态
+    if event.sender_id not in user_states:
+        user_states[event.sender_id] = UserState()
+    user_state = user_states[event.sender_id]
+    user_state.waiting_search = True
+    user_state.current_path = path
+    user_state.search_type = 'filename'
+    
+    buttons = [[Button.inline('🚫 取消', 'cancel')]]
+    await event.respond('🔍 请输入要搜索的文件名（支持通配符 * 和 ?）:', buttons=buttons)
+
+@bot.on(events.CallbackQuery(pattern=r'search_content:(.+)'))
+async def search_content_start(event):
+    """开始文件内容搜索流程"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    path = event.pattern_match.group(1).decode()
+    
+    # 保存用户状态
+    if event.sender_id not in user_states:
+        user_states[event.sender_id] = UserState()
+    user_state = user_states[event.sender_id]
+    user_state.waiting_search = True
+    user_state.current_path = path
+    user_state.search_type = 'content'
+    
+    buttons = [[Button.inline('🚫 取消', 'cancel')]]
+    await event.respond('🔍 请输入要搜索的文本内容:', buttons=buttons)
+
+# 在主消息处理函数中添加搜索处理
+async def handle_search(event, user_state):
+    """处理搜索请求"""
+    search_term = event.text.strip()
+    base_path = pathlib.Path(user_state.current_path)
+    
+    try:
+        results = []
+        # 定义要排除的目录和路径
+        excluded_dirs = {'.git', '__pycache__', 'node_modules', 'venv', '.venv'}
+        excluded_paths = {'/proc', '/sys', '/dev', '/run', '/tmp'}
+        
+        # 检查基础路径是否在排除路径中
+        if any(str(base_path).startswith(ep) for ep in excluded_paths):
+            await event.respond('❌ 无法在系统目录中搜索')
+            return
+        
+        if user_state.search_type == 'filename':
+            # 搜索文件名
+            pattern = search_term.replace('*', '.*').replace('?', '.')
+            for path in base_path.rglob('*'):
+                try:
+                    path_str = str(path)
+                    # 提前检查路径，跳过系统目录
+                    if (any(excluded in path_str for excluded in excluded_dirs) or
+                        any(path_str.startswith(ep) for ep in excluded_paths)):
+                        continue
+                    
+                    # 检查路径是否是符号链接或特殊文件
+                    try:
+                        if (path.is_symlink() or 
+                            not path.exists() or 
+                            not os.access(path_str, os.R_OK)):
+                            continue
+                    except (OSError, PermissionError):
+                        continue
+                    
+                    if re.search(pattern, path.name, re.IGNORECASE):
+                        # 再次检查路径是否有效
+                        if os.path.exists(path_str) and os.access(path_str, os.R_OK):
+                            results.append(path)
+                            if len(results) >= 20:  # 限制结果数量
+                                break
+                except (PermissionError, FileNotFoundError, OSError):
+                    continue
+                except Exception:
+                    continue
+        else:
+            # 搜索文件内容
+            for path in base_path.rglob('*'):
+                try:
+                    path_str = str(path)
+                    # 提前检查路径，跳过系统目录
+                    if (any(excluded in path_str for excluded in excluded_dirs) or
+                        any(path_str.startswith(ep) for ep in excluded_paths)):
+                        continue
+                    
+                    # 检查文件类型和权限
+                    try:
+                        if (not path.is_file() or
+                            path.is_symlink() or
+                            not path.exists() or
+                            not os.access(path_str, os.R_OK) or
+                            path.suffix not in ['.txt', '.py', '.json', '.log', '.conf', '.md']):
+                            continue
+                        
+                        # 检查文件大小
+                        if path.stat().st_size > 1024 * 1024:  # 跳过大于1MB的文件
+                            continue
+                            
+                        # 尝试读取文件内容
+                        content = path.read_text(encoding='utf-8')
+                        if search_term.lower() in content.lower():
+                            results.append(path)
+                            if len(results) >= 20:  # 限制结果数量
+                                break
+                    except (UnicodeDecodeError, PermissionError, OSError):
+                        continue
+                except Exception:
+                    continue
+        
+        if results:
+            buttons = []
+            message = f'🔍 搜索结果 ({len(results)} 个匹配):\n\n'
+            
+            for path in results:
+                try:
+                    # 使用 os.path.relpath 来获取相对路径，并处理可能的错误
+                    try:
+                        rel_path = os.path.relpath(str(path), str(base_path))
+                    except ValueError:
+                        # 如果无法获取相对路径，使用完整路径
+                        rel_path = str(path)
+                    
+                    if user_state.search_type == 'content':
+                        try:
+                            if os.path.exists(str(path)) and os.access(str(path), os.R_OK):
+                                content = path.read_text(encoding='utf-8')
+                                lines = content.split('\n')
+                                matched_lines = [
+                                    (i+1, line.strip()) 
+                                    for i, line in enumerate(lines) 
+                                    if search_term.lower() in line.lower()
+                                ][:2]  # 只显示前两个匹配
+                                
+                                message += f'📄 {rel_path}\n'
+                                for line_num, line in matched_lines:
+                                    # 截取匹配行周围的内容
+                                    trimmed_line = line[:50]
+                                    if len(line) > 50:
+                                        trimmed_line += '...'
+                                    message += f'  第{line_num}行: {trimmed_line}\n'
+                                message += '\n'
+                        except:
+                            continue
+                    else:
+                        message += f'📄 {rel_path}\n'
+                    
+                    # 为每个文件添加操作按钮
+                    if os.path.exists(str(path)) and os.access(str(path), os.R_OK):
+                        buttons.append([Button.inline(f'📂 打开 {path.name}', f'file:{path}')])
+                except:
+                    continue
+            
+            # 添加底部按钮
+            buttons.extend([
+                [Button.inline('🔄 新搜索', f'search:{base_path}')],
+                [Button.inline('📂 返回文件浏览器', 'ls')]
+            ])
+            
+            await event.respond(message, buttons=buttons)
+        else:
+            buttons = [
+                [Button.inline('🔄 新搜索', f'search:{base_path}')],
+                [Button.inline('📂 返回文件浏览器', 'ls')]
+            ]
+            await event.respond('❌ 未找到匹配的结果', buttons=buttons)
+            
+    except Exception as e:
+        await event.respond(f'❌ 搜索出错: {str(e)}')
+    finally:
+        user_state.waiting_search = False
+        user_state.search_type = None
 
 def main():
     """启动机器人"""
