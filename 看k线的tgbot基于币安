@@ -1,0 +1,551 @@
+from telethon import TelegramClient, events, Button
+from binance.client import Client
+import mplfinance as mpf
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+from dotenv import load_dotenv
+import numpy as np
+from datetime import datetime, timedelta
+from collections import defaultdict
+import time
+
+# 加载环境变量
+load_dotenv()
+
+# Telegram API 配置
+API_ID = os.getenv('API_ID')
+API_HASH = os.getenv('API_HASH')
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+
+# Binance API 配置
+BINANCE_API_KEY = os.getenv('BINANCE_API_KEY')
+BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET')
+
+# 创建客户端
+client = TelegramClient('kline_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+
+# 在文件开头添加时间周期常量
+TIME_FRAMES = {
+    '1m': Client.KLINE_INTERVAL_1MINUTE,
+    '5m': Client.KLINE_INTERVAL_5MINUTE,
+    '15m': Client.KLINE_INTERVAL_15MINUTE,
+    '1h': Client.KLINE_INTERVAL_1HOUR,
+    '4h': Client.KLINE_INTERVAL_4HOUR,
+    '1d': Client.KLINE_INTERVAL_1DAY
+}
+
+# 查询间隔限制配置
+COOLDOWN_TIME = 3  # 冷却时间（秒）
+user_last_query = defaultdict(float)  # 记录用户最后查询时间
+
+async def get_valid_symbol(symbol):
+    """验证并返回有效的交易对名称"""
+    symbol = symbol.upper()
+    if not symbol.endswith('USDT'):
+        symbol += 'USDT'
+    
+    try:
+        info = await client.loop.run_in_executor(
+            None, binance_client.get_exchange_info
+        )
+        valid_symbols = [s['symbol'] for s in info['symbols']]
+        
+        if symbol not in valid_symbols:
+            return None
+        return symbol
+    except Exception as e:
+        print(f"Error checking symbol: {e}")
+        return None
+
+async def generate_kline_chart(symbol, interval=Client.KLINE_INTERVAL_15MINUTE):
+    """生成指定交易对的K线图"""
+    try:
+        # 获取K线数据
+        klines = await client.loop.run_in_executor(
+            None,
+            lambda: binance_client.get_klines(symbol=symbol, interval=interval, limit=50)
+        )
+
+        # 创建 DataFrame
+        data = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+                                           'close_time', 'quote_asset_volume', 'number_of_trades',
+                                           'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+        
+        # 转换数据类型
+        data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
+        # 转换为北京时间 (UTC+8)
+        data['timestamp'] = data['timestamp'] + pd.Timedelta(hours=8)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            data[col] = data[col].astype(float)
+
+        data.set_index('timestamp', inplace=True)
+
+        # 设置图表样式
+        mc = mpf.make_marketcolors(
+            up='#26a69a',
+            down='#ef5350',
+            edge='inherit',
+            wick='#666666',
+            volume='in',
+            ohlc='inherit'
+        )
+        
+        s = mpf.make_mpf_style(
+            marketcolors=mc,
+            gridstyle=':',
+            y_on_right=True,
+            facecolor='white',
+            edgecolor='#f0f0f0',
+            gridcolor='#f6f6f6',
+            rc={
+                'axes.labelsize': 9,
+                'axes.titlesize': 12,
+                'xtick.labelsize': 8,
+                'ytick.labelsize': 8,
+                'grid.alpha': 0.1,
+                'axes.grid': True,
+                'axes.grid.axis': 'y',
+                'axes.edgecolor': '#e0e0e0',
+                'axes.linewidth': 0.5,
+                'patch.linewidth': 1.0,
+                'lines.linewidth': 1.5
+            }
+        )
+
+        # 绘制K线图
+        fig, axes = mpf.plot(
+            data,
+            type='candle',
+            title='',
+            ylabel='',
+            ylabel_lower='',
+            volume=True,
+            mav=(5, 10, 20),
+            mavcolors=['#7986cb', '#64b5f6', '#90a4ae'],
+            style=s,
+            figsize=(16, 9),
+            returnfig=True,
+            panel_ratios=(8, 1),
+            tight_layout=False,
+            scale_padding={'left': 0.1, 'right': 1.5, 'top': 0.5, 'bottom': 0.1},
+            volume_alpha=0.3
+        )
+
+        # 调整子图之间的间距
+        plt.subplots_adjust(
+            left=0.05,      # 左边距
+            right=0.95,     # 右边距
+            top=0.95,       # 上边距
+            bottom=0.1,     # 底部边距
+            hspace=0.0001   # 极小的间距
+        )
+
+        # 为K线图添加时间轴
+        ax_time = axes[0].twiny()  # 创建一个共享y轴的新x轴
+        ax_time.set_xlim(axes[0].get_xlim())
+        
+        # 计算合适的时间刻度
+        num_ticks = 5  # 改为5个时间点
+        tick_positions = np.linspace(0, len(data)-1, num_ticks, dtype=int)
+        
+        # 设置刻度位置和标签
+        ax_time.set_xticks(tick_positions)
+        ax_time.set_xticklabels([data.index[i].strftime('%H:%M') for i in tick_positions])
+        
+        # 设置时间轴的样式
+        ax_time.spines['top'].set_visible(False)
+        ax_time.spines['right'].set_visible(False)
+        ax_time.spines['bottom'].set_position(('outward', 0))  # 将时间轴紧贴K线图底部
+        ax_time.tick_params(axis='x', colors='#666666', labelsize=8, length=2, pad=2)
+
+        # 隐藏成交量图的x轴标��
+        axes[2].xaxis.set_visible(False)
+
+        # 调整成交量图的高度和位置
+        box = axes[2].get_position()
+        axes[2].set_position([box.x0, box.y0 + box.height * 0.3, box.width, box.height * 0.5])
+
+        # 移除原来的x轴标签
+        axes[0].xaxis.set_visible(False)
+
+        # 调整标题
+        axes[0].set_title(f'{symbol}', fontsize=12, pad=10)
+        
+        # 移除轴标签
+        axes[0].set_ylabel('')
+        axes[2].set_ylabel('')
+
+        # 设置背景和边框
+        fig.patch.set_facecolor('white')
+        for ax in axes:
+            ax.set_facecolor('#ffffff')
+            for spine in ax.spines.values():
+                spine.set_color('#e0e0e0')
+                spine.set_linewidth(0.5)
+            ax.tick_params(colors='#666666', labelsize=8, length=2)
+            ax.grid(True, linestyle=':', color='#f6f6f6', alpha=0.2)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+
+        # 获取价格数据
+        last_price = data['close'].iloc[-1]
+        open_price = data['open'].iloc[-1]
+        high_price = data['high'].iloc[-1]
+        low_price = data['low'].iloc[-1]
+        price_change = ((last_price - data['close'].iloc[-2]) / data['close'].iloc[-2]) * 100
+        
+        # 计算24小时交易量
+        volume_24h = data['volume'].sum()
+        
+        # 在图表右上角添加最新价格和涨跌幅
+        price_color = '#26a69a' if price_change >= 0 else '#ef5350'
+        axes[0].text(0.98, 0.98,
+                    f'${last_price:,.2f}\n{price_change:+.2f}%',
+                    transform=axes[0].transAxes,
+                    color=price_color,
+                    fontsize=12,
+                    ha='right',
+                    va='top',
+                    bbox=dict(facecolor='white',
+                            edgecolor='none',
+                            alpha=0.8,
+                            pad=5))
+
+        # 添加价格信息文本框
+        info_text = (
+            f'Last: ${last_price:,.2f}  24h Change: {price_change:+.2f}%\n'
+            f'Open: ${open_price:,.2f}  High: ${high_price:,.2f}\n'
+            f'Close: ${last_price:,.2f}  Low: ${low_price:,.2f}\n'
+            f'24h Volume: {volume_24h:,.0f} USDT'
+        )
+        
+        # 在图表底部添加文本框
+        fig.text(0.01, 0.02, 
+                info_text,
+                fontsize=9,
+                color='#666666',
+                bbox=dict(facecolor='white',
+                         edgecolor='#e0e0e0',
+                         alpha=0.8,
+                         pad=10,
+                         boxstyle='round'))
+
+        # 调整图表��局以留出空间
+        plt.subplots_adjust(bottom=0.15)
+
+        # 保存图片
+        filename = f'{symbol.lower()}_chart.png'
+        plt.savefig(filename, 
+                    dpi=300, 
+                    bbox_inches='tight',
+                    facecolor='white',
+                    edgecolor='none',
+                    pad_inches=0.2,
+                    transparent=False)
+        plt.close()
+
+        # 计算更多技术指标
+        # 计算RSI
+        delta = data['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs)).iloc[-1]
+
+        # 计算24小时价格变化
+        price_24h_change = ((last_price - data['close'].iloc[0]) / data['close'].iloc[0]) * 100
+        
+        # 获取买卖订单簿深度
+        depth = await client.loop.run_in_executor(
+            None,
+            lambda: binance_client.get_order_book(symbol=symbol, limit=5)
+        )
+        
+        # 计算买卖压力
+        buy_pressure = sum(float(bid[1]) for bid in depth['bids'][:5])
+        sell_pressure = sum(float(ask[1]) for ask in depth['asks'][:5])
+        pressure_ratio = (buy_pressure / sell_pressure) if sell_pressure > 0 else 1
+
+        # 计算成交量变化
+        vol_change = ((data['volume'].iloc[-1] - data['volume'].iloc[-2]) / data['volume'].iloc[-2]) * 100
+
+        # 返回扩展的价格数据
+        price_data = {
+            'last_price': last_price,
+            'price_change': price_change,
+            'price_24h_change': price_24h_change,
+            'open_price': open_price,
+            'high_price': high_price,
+            'low_price': low_price,
+            'volume_24h': volume_24h,
+            'rsi': rsi,
+            'buy_pressure': buy_pressure,
+            'sell_pressure': sell_pressure,
+            'pressure_ratio': pressure_ratio,
+            'vol_change': vol_change,
+            'best_bid': float(depth['bids'][0][0]),
+            'best_ask': float(depth['asks'][0][0]),
+            'spread': float(depth['asks'][0][0]) - float(depth['bids'][0][0])
+        }
+        return filename, price_data
+
+    except Exception as e:
+        print(f"Error generating chart for {symbol}: {e}")
+        return None
+
+@client.on(events.NewMessage(pattern=r'^[a-zA-Z]+$'))
+async def handle_message(event):
+    """处理用户消息"""
+    try:
+        # 检查用户查询间隔
+        current_time = time.time()
+        if current_time - user_last_query[event.sender_id] < COOLDOWN_TIME:
+            remaining = round(COOLDOWN_TIME - (current_time - user_last_query[event.sender_id]), 1)
+            await event.reply(f"⏳ 请等待 {remaining} 秒后再次查询")
+            return
+            
+        # 更新最后查询时间
+        user_last_query[event.sender_id] = current_time
+        
+        # 发送等待消息
+        wait_msg = await event.reply("正在生成图表，请稍候...")
+        
+        # 获取并验证交易对
+        symbol = event.text.strip().upper()
+        if not symbol.endswith('USDT'):
+            symbol += 'USDT'
+
+        # 生成图表和获取数据
+        result = await generate_kline_chart(symbol)
+        if not result:
+            await wait_msg.edit("生成图表失败，请重试。")
+            return
+
+        chart_file, price_data = result  # 现在使用 price_data
+
+        # 构建简短的价格信息
+        price_emoji = "🟢" if price_data['price_change'] >= 0 else "🔴"
+        change_arrow = "↗️" if price_data['price_change'] >= 0 else "↘️"
+        
+        # 根据价格大小动态调整显示精度
+        def format_price(price):
+            if price >= 1:
+                return f"${price:,.2f}"
+            elif price >= 0.0001:
+                return f"${price:.6f}"
+            else:
+                return f"${price:.8f}"
+
+        # 构建简短的状态消息
+        caption = (
+            f"{symbol} {price_emoji}\n"
+            f"价格: {format_price(price_data['last_price'])} {change_arrow}\n"
+            f"24h: {price_data['price_change']:+.2f}%\n"
+            f"成交量: {price_data['volume_24h']:,.0f} USDT"
+        )
+
+        # 创建时间周期和详细数据按钮
+        buttons = [
+            [
+                Button.inline("1m", f"timeframe_{symbol}_1m"),
+                Button.inline("5m", f"timeframe_{symbol}_5m"),
+                Button.inline("15m ✓", f"timeframe_{symbol}_15m"),
+            ],
+            [
+                Button.inline("1h", f"timeframe_{symbol}_1h"),
+                Button.inline("4h", f"timeframe_{symbol}_4h"),
+                Button.inline("1d", f"timeframe_{symbol}_1d"),
+            ],
+            [
+                Button.inline("查看详细数据", f"details_{symbol}")
+            ]
+        ]
+
+        # 发送图表、简短信息和按钮
+        await event.reply(caption, file=chart_file, buttons=buttons)
+        await wait_msg.delete()
+        
+        # 删除图表文件
+        os.remove(chart_file)
+
+    except Exception as e:
+        await event.reply(f"发生错误: {str(e)}")
+
+# 添加详细数据按钮的回调处理
+@client.on(events.CallbackQuery(pattern=r"details_(.+)"))
+async def handle_details(event):
+    try:
+        # 检查用户查询间隔
+        current_time = time.time()
+        if current_time - user_last_query[event.sender_id] < COOLDOWN_TIME:
+            remaining = round(COOLDOWN_TIME - (current_time - user_last_query[event.sender_id]), 1)
+            await event.answer(f"⏳ 请等待 {remaining} 秒后再查询", alert=True)
+            return
+            
+        # 更新最后查询时间
+        user_last_query[event.sender_id] = current_time
+        
+        # 获取交易对并处理字节字符串
+        symbol = event.pattern_match.group(1)
+        if isinstance(symbol, bytes):
+            symbol = symbol.decode()
+        
+        # 移除可能的 b'' 标记
+        if symbol.startswith("b'") and symbol.endswith("'"):
+            symbol = symbol[2:-1]
+        
+        # 生成图表和获取数据
+        result = await generate_kline_chart(symbol)
+        if not result:
+            await event.answer("获取数据失败，请重试。", alert=True)
+            return
+
+        _, price_data = result
+
+        # 构建详细数据消息
+        price_emoji = "🟢" if price_data['price_change'] >= 0 else "🔴"
+        change_arrow = "↗️" if price_data['price_change'] >= 0 else "↘️"
+        
+        # 计算额外数据
+        price_range = price_data['high_price'] - price_data['low_price']
+        range_percent = (price_range / price_data['low_price']) * 100
+        avg_price = (price_data['high_price'] + price_data['low_price']) / 2
+        price_change = price_data['price_change']
+        
+        # 获取北京时间
+        beijing_time = (datetime.now() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # 根据价格大小动态调整显示精度
+        def format_price(price):
+            if price >= 1:
+                return f"${price:,.2f}"
+            elif price >= 0.0001:
+                return f"${price:.6f}"
+            else:
+                return f"${price:.8f}"
+        
+        message = (
+            f"📊 {symbol} 市场行情\n\n"
+            f"{price_emoji} 当前价格: {format_price(price_data['last_price'])} {change_arrow}\n"
+            f"├ 24h涨跌: {price_data['price_change']:+.2f}%\n"
+            f"└ 整体涨跌: {price_data['price_24h_change']:+.2f}%\n\n"
+            f"📈 价格区间\n"
+            f"├ 最高价: {format_price(price_data['high_price'])}\n"
+            f"├ 最低价: {format_price(price_data['low_price'])}\n"
+            f"├ 波动值: {format_price(price_range)} ({range_percent:.1f}%)\n"
+            f"└ 均价: {format_price(avg_price)}\n\n"
+            f"📊 交易信息\n"
+            f"├ 开盘价: {format_price(price_data['open_price'])}\n"
+            f"├ 成交量: {price_data['volume_24h']:,.0f} USDT\n"
+            f"├ 量比变化: {price_data['vol_change']:+.1f}%\n"
+            f"└ 状态: {'活跃' if price_data['volume_24h'] > 0 else '不活跃'}\n\n"
+            f"📗 买卖挂单\n"
+            f"├ 最佳买价: {format_price(price_data['best_bid'])}\n"
+            f"├ 最佳卖价: {format_price(price_data['best_ask'])}\n"
+            f"├ 买卖差价: {format_price(price_data['spread'])}\n"
+            f"└ 买卖比例: {price_data['pressure_ratio']:,.2f}\n\n"
+            f"📉 技术指标\n"
+            f"├ RSI(14): {price_data['rsi']:.1f}\n"
+            f"├ 距最高: {((price_data['high_price'] - price_data['last_price']) / price_data['high_price'] * 100):,.1f}%\n"
+            f"├ 距最低: {((price_data['last_price'] - price_data['low_price']) / price_data['low_price'] * 100):+,.1f}%\n"
+            f"└ 波动率: {range_percent:.1f}%\n\n"
+            f"🕒 市场情绪\n"
+            f"├ RSI指示: {'超买' if price_data['rsi'] > 70 else '超卖' if price_data['rsi'] < 30 else '中性'}\n"
+            f"├ 量价关系: {'量价齐升' if price_data['vol_change'] > 0 and price_change > 0 else '量价齐跌' if price_data['vol_change'] < 0 and price_change < 0 else '背离'}\n"
+            f"└ 买卖压力: {'买方占优' if price_data['pressure_ratio'] > 1.2 else '卖方占优' if price_data['pressure_ratio'] < 0.8 else '平衡'}"
+        )
+
+        # 发送详细数据消息
+        await event.answer()  # 清除加载状态
+        await event.respond(message)
+
+    except Exception as e:
+        await event.answer(f"发生错误: {str(e)}", alert=True)
+
+# 添加按钮回调处理函数
+@client.on(events.CallbackQuery(pattern=r"timeframe_(.+)_(.+)"))
+async def handle_timeframe_change(event):
+    try:
+        # 检查用户查询间隔
+        current_time = time.time()
+        if current_time - user_last_query[event.sender_id] < COOLDOWN_TIME:
+            remaining = round(COOLDOWN_TIME - (current_time - user_last_query[event.sender_id]), 1)
+            await event.answer(f"⏳ 请等待 {remaining} 秒后再操作", alert=True)
+            return
+            
+        # 更新最后查询时间
+        user_last_query[event.sender_id] = current_time
+        
+        # 解析回调数据并处理字节字符串
+        symbol, timeframe = event.pattern_match.groups()
+        if isinstance(symbol, bytes):
+            symbol = symbol.decode()
+        if isinstance(timeframe, bytes):
+            timeframe = timeframe.decode()
+            
+        # 移除可能的 b'' 标记
+        if symbol.startswith("b'") and symbol.endswith("'"):
+            symbol = symbol[2:-1]
+        
+        # 发送等待消息
+        await event.answer(f"正在切换到{timeframe}周期...")
+        
+        # 生成新的图表
+        result = await generate_kline_chart(symbol, TIME_FRAMES[timeframe])
+        if not result:
+            await event.answer("生成图表失败，请重试。", alert=True)
+            return
+
+        chart_file, _ = result
+
+        # 更新按钮状态
+        buttons = [
+            [
+                Button.inline("1m ✓" if timeframe == "1m" else "1m", f"timeframe_{symbol}_1m"),
+                Button.inline("5m ✓" if timeframe == "5m" else "5m", f"timeframe_{symbol}_5m"),
+                Button.inline("15m ✓" if timeframe == "15m" else "15m", f"timeframe_{symbol}_15m"),
+            ],
+            [
+                Button.inline("1h ✓" if timeframe == "1h" else "1h", f"timeframe_{symbol}_1h"),
+                Button.inline("4h ✓" if timeframe == "4h" else "4h", f"timeframe_{symbol}_4h"),
+                Button.inline("1d ✓" if timeframe == "1d" else "1d", f"timeframe_{symbol}_1d"),
+            ],
+            [
+                Button.inline("查看详细数据", f"details_{symbol}")
+            ]
+        ]
+
+        # 更新消息
+        message = await event.get_message()
+        await message.edit(file=chart_file, buttons=buttons)
+        
+        # 删除图表文件
+        os.remove(chart_file)
+
+    except Exception as e:
+        print(f"Error in timeframe change: {e}")  # 添加错误日志
+        await event.answer(f"发生错误: {str(e)}", alert=True)
+
+@client.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    """处理 /start 命令"""
+    await event.reply(
+        "欢迎使用 K 线图机器人！\n\n"
+        "直接发送任意币种符号，即可获取该币的实时 K 线图。\n"
+        "如：<code>BTC</code>、<code>ETH</code>、<code>SOL</code>、<code>PEPE</code>（大小写均可）……\n\n"
+        "支持所有币安现货交易对。"
+        "<a href='https://t.me/zouxin77'>\n如果遇到问题或有任何疑问，点击联系我们</a>\n\n"  # 使用 HTML 格式的链接
+        ,
+        parse_mode='html',
+        link_preview=False
+    )
+
+def main():
+    """启动机器人"""
+    print("机器人已启动...")
+    client.run_until_disconnected()
+
+if __name__ == '__main__':
+    main()
