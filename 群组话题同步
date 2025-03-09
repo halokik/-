@@ -1,0 +1,159 @@
+from telethon import TelegramClient, events
+import asyncio
+import json
+from telethon.tl import functions, types
+import os
+
+# 请替换为您的实际 api_id、api_hash 和 bot_token
+api_id = '21332425'
+api_hash = 'f5d0cddc784e3a7a09ea9714ed01f238'
+bot_token = '7139061843:AAFSh2bkkQM6VC6Iskdy25u28vLeWeK84dE'
+
+# 目标话题群组的 ID
+TARGET_GROUP_ID = -1002318762616  # 替换为您的目标群组 ID
+
+# 存储源群组名称与话题 ID 的映射
+TOPIC_MAPPING_FILE = 'topic_mapping.json'
+
+# 加载现有的映射
+try:
+    with open(TOPIC_MAPPING_FILE, 'r', encoding='utf-8') as f:
+        topic_mapping = json.load(f)
+except FileNotFoundError:
+    topic_mapping = {}
+
+
+async def create_topic(client, group_id, topic_title, group_info):
+    try:
+        result = await client(functions.channels.CreateForumTopicRequest(
+            channel=group_id,
+            title=topic_title,
+            icon_color=0x6FB3FF
+        ))
+        # 检查返回的结果结构
+        topic_id = None
+        if hasattr(result, 'updates'):
+            for update in result.updates:
+                if isinstance(update, types.UpdateMessageID):
+                    topic_id = update.id
+                    break
+
+        if topic_id:
+            # 发送群组信息作为第一条消息
+            info_message = f"群组信息:\n名称: {group_info['title']}\n用户名: {group_info['username']}\nID: {group_info['id']}"
+            await client.send_message(
+                entity=group_id,
+                message=info_message,
+                reply_to=topic_id
+            )
+            print(f"创建话题成功，ID: {topic_id}，并发送了群组信息")
+            return topic_id
+        else:
+            print(f"创建话题成功，但无法获取话题 ID。返回结果：{result}")
+            return None
+    except Exception as e:
+        print(f"创建话题时发生错误: {e}")
+        return None
+
+
+async def message_handler(event):
+    try:
+        # 忽略私聊消息和机器人自身的消息
+        if event.is_private or event.sender.bot:
+            return
+
+        sender = await event.get_sender()
+        chat = await event.get_chat()
+
+        sender_name = sender.first_name or ''
+        if sender.last_name:
+            sender_name += f' {sender.last_name}'
+
+        username = f'@{sender.username}' if sender.username else ''
+
+        message_text = event.raw_text or ''
+        source_group_name = chat.title
+
+        print(f"收到来自 {source_group_name} 的消息")  # 调试输出
+
+        # 检查是否已有该群组名称对应的话题 ID
+        topic_id = topic_mapping.get(source_group_name)
+
+        if topic_id is None:
+            # 获取群组信息
+            group_info = {
+                'title': chat.title,
+                'username': chat.username if hasattr(chat, 'username') else None,
+                'id': chat.id
+            }
+            # 创建新话题
+            topic_id = await create_topic(event.client, TARGET_GROUP_ID, source_group_name, group_info)
+            if topic_id:
+                # 保存映射
+                topic_mapping[source_group_name] = topic_id
+                with open(TOPIC_MAPPING_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(topic_mapping, f, ensure_ascii=False)
+            else:
+                print(f"无法为群组 {source_group_name} 创建话题")
+                return
+
+        # 构建要发送的消息内容
+        forward_text = f"{sender_name} ({username}):"
+
+        # 在对应的话题中发送消息
+        try:
+            if event.media:
+                # 如果消息包含媒体（图片或视频）
+                if isinstance(event.media, (types.MessageMediaPhoto, types.MessageMediaDocument)):
+                    # 下载媒体文件
+                    file = await event.download_media()
+
+                    # 发送媒体文件
+                    sent_message = await event.client.send_file(
+                        entity=TARGET_GROUP_ID,
+                        file=file,
+                        caption=forward_text + (message_text if message_text else ""),
+                        reply_to=topic_id
+                    )
+
+                    # 获取并打印媒体文件的ID
+                    if isinstance(event.media, types.MessageMediaPhoto):
+                        media_id = event.media.photo.id
+                        print(f"同步了图片，ID: {media_id}")
+                    elif isinstance(event.media, types.MessageMediaDocument):
+                        media_id = event.media.document.id
+                        print(f"同步了视频或文件，ID: {media_id}")
+
+                    # 删除临时文件
+                    os.remove(file)
+
+                    print(f"消息已转发到话题 {topic_id}")
+            else:
+                # 如果是纯文本消息
+                await event.client.send_message(
+                    entity=TARGET_GROUP_ID,
+                    message=forward_text + message_text,
+                    reply_to=topic_id
+                )
+                print(f"消息已转发到话题 {topic_id}")
+        except Exception as e:
+            print(f"发送消息时发生错误: {e}")
+
+    except Exception as e:
+        print(f"处理消息时发生错误: {e}")
+
+
+async def main():
+    client = TelegramClient('bot_session', api_id, api_hash)
+    await client.start(bot_token=bot_token)
+
+    @client.on(events.NewMessage(chats=None))
+    async def handler(event):
+        await message_handler(event)
+
+    print("Bot started...")
+    await client.run_until_disconnected()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
