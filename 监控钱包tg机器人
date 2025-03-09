@@ -1,0 +1,400 @@
+import logging
+import json
+import time
+import requests
+import asyncio
+from datetime import datetime
+from telethon import TelegramClient
+from telethon.tl.custom import Button
+from tronapi import Tron
+from decimal import Decimal
+from telethon import events
+
+# 配置日志
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class WalletMonitor:
+    def __init__(self, api_id, api_hash, bot_token, tron_api_key, control_address, bot_username, customer_service_id, group_link):
+        """初始化钱包监控器"""
+        self.client = TelegramClient('wallet_monitor_bot', api_id, api_hash)
+        self.bot_token = bot_token
+        self.tron = Tron()
+        self.tron_api_key = tron_api_key
+        self.control_address = control_address
+        self.bot_username = bot_username
+        self.customer_service_id = customer_service_id
+        self.group_link = group_link
+        
+        # 从文件加载监听的地址
+        self.monitored_addresses = self.load_monitored_addresses()
+        
+        # 设置 TRON API
+        self.tron.private_key = None
+        self.tron.default_address = None
+        self.tron.tron.setDefaultBlock('latest')
+
+    def load_monitored_addresses(self):
+        """从文件加载监听的地址"""
+        addresses = {}
+        try:
+            with open('监听.txt', 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        timestamp, chat_id_str, address_str = line.strip().split(' - ')
+                        chat_id = int(chat_id_str.split(': ')[1])
+                        address = address_str.split(': ')[1]
+                        if address not in addresses:
+                            addresses[address] = []
+                        addresses[address].append(chat_id)
+                    except Exception as e:
+                        logger.error(f"Error parsing line {line}: {e}")
+        except FileNotFoundError:
+            open('监听.txt', 'w', encoding='utf-8').close()
+        return addresses
+
+    async def get_account_info(self, address):
+        """获取账户信息"""
+        url = f"https://apilist.tronscan.org/api/account?address={address}"
+        try:
+            async with self.client.session.get(url) as response:
+                account_info = await response.json()
+                
+                balance = int(account_info["balance"]) / 1000000
+                energy_used = account_info["bandwidth"]["energyUsed"]
+                energy_limit = account_info["bandwidth"]["energyLimit"]
+                energy_remaining = energy_limit - energy_used
+                bandwidth_used = account_info["bandwidth"]["freeNetUsed"]
+                bandwidth_limit = account_info["bandwidth"]["freeNetLimit"]
+                bandwidth_remaining = bandwidth_limit - bandwidth_used
+
+                usdt_balance = 0.0
+                for token in account_info.get("trc20token_balances", []):
+                    if token["tokenAbbr"] == "USDT":
+                        usdt_balance = int(token["balance"]) / (10 ** int(token["tokenDecimal"]))
+                        break
+
+                return energy_remaining, bandwidth_remaining, balance, usdt_balance
+        except Exception as e:
+            logger.error(f"Error getting account info for {address}: {e}")
+            return None, None, None, None
+
+    async def get_account_info_with_retry(self, address, max_retries=3):
+        """带重试机制的账户信息获取"""
+        for i in range(max_retries):
+            try:
+                result = await self.get_account_info(address)
+                if result[0] is not None:
+                    return result
+            except Exception as e:
+                logger.error(f"Attempt {i+1} failed: {e}")
+                if i < max_retries - 1:
+                    await asyncio.sleep(2 ** i)  # 指数退避
+        return None, None, None, None
+
+    async def monitor_transaction(self, block):
+        """监控交易"""
+        try:
+            formatted_date_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            keyboard = [
+                [
+                    Button.url("自助服务", self.bot_username),
+                    Button.url("联系客服", self.customer_service_id)
+                ]
+            ]
+
+            for transaction in block['transactions']:
+                if transaction['ret'][0]['contractRet'] != 'SUCCESS':
+                    continue
+
+                contract = transaction['raw_data']['contract'][0]
+                contract_type = contract['type']
+                value = contract['parameter']['value']
+
+                if contract_type == 'TriggerSmartContract' and value['contract_address'] == '41a614f803b6fd780986a42c78ec9c7f77e6ded13c':
+                    # USDT交易处理
+                    await self.handle_usdt_transaction(transaction, formatted_date_time, keyboard)
+                elif contract_type == 'TransferContract':
+                    # TRX交易处理
+                    await self.handle_trx_transaction(transaction, formatted_date_time, keyboard)
+
+        except Exception as e:
+            logger.error(f"Error monitoring transaction: {e}")
+
+    async def handle_usdt_transaction(self, transaction, formatted_date_time, keyboard):
+        """处理USDT交易"""
+        value = transaction['raw_data']['contract'][0]['parameter']['value']
+        data = value['data']
+        
+        if data[:8] != 'a9059cbb':
+            return
+
+        to_address = self.tron.address.from_hex('41' + data[32:72]).decode()
+        from_address = self.tron.address.from_hex(value['owner_address']).decode()
+        amount = int(data[72:136], 16) / 1000000
+
+        # 收款监听
+        if to_address in self.monitored_addresses:
+            energy_remaining, bandwidth_remaining, balance, usdt_balance = await self.get_account_info(to_address)
+            for chat_id in self.monitored_addresses[to_address]:
+                try:
+                    message = (
+                        f'✅*收入到账 +{amount}USDT*\n'
+                        f'付款地址：`{from_address}`\n'
+                        f'收款地址：`{to_address}`\n'
+                        f'交易时间：{formatted_date_time}\n'
+                        f'交易金额：{amount}USDT\n'
+                        f'账户余额：{round(balance, 2)}TRX，{round(usdt_balance, 2)}USDT'
+                    )
+                    await self.client.send_message(chat_id, message, buttons=keyboard, parse_mode='markdown')
+                except Exception as e:
+                    logger.error(f"Error sending USDT transaction message to {chat_id}: {e}")
+
+        # 支出监听
+        if from_address in self.monitored_addresses:
+            energy_remaining, bandwidth_remaining, balance, usdt_balance = await self.get_account_info(from_address)
+            for chat_id in self.monitored_addresses[from_address]:
+                try:
+                    message = (
+                        f'❎*支出提醒 -{amount}USDT*\n'
+                        f'付款地址：`{from_address}`\n'
+                        f'收款地址：`{to_address}`\n'
+                        f'交易时间：{formatted_date_time}\n'
+                        f'交易金额：{amount}USDT\n'
+                        f'账户余额：{round(balance, 2)}TRX，{round(usdt_balance, 2)}USDT'
+                    )
+                    await self.client.send_message(chat_id, message, buttons=keyboard, parse_mode='markdown')
+                except Exception as e:
+                    logger.error(f"Error sending USDT transaction message to {chat_id}: {e}")
+
+    async def handle_trx_transaction(self, transaction, formatted_date_time, keyboard):
+        """处理TRX交易"""
+        value = transaction['raw_data']['contract'][0]['parameter']['value']
+        from_address = self.tron.address.from_hex(value['owner_address']).decode()
+        to_address = self.tron.address.from_hex(value['to_address']).decode()
+        amount = value['amount'] / 1000000
+
+        # 支出监听
+        if from_address in self.monitored_addresses:
+            energy_remaining, bandwidth_remaining, balance, usdt_balance = await self.get_account_info(from_address)
+            for chat_id in self.monitored_addresses[from_address]:
+                try:
+                    message = (
+                        f'❎*支出提醒 -{amount}TRX*\n'
+                        f'付款地址：`{from_address}`\n'
+                        f'收款地址：`{to_address}`\n'
+                        f'交易时间：{formatted_date_time}\n'
+                        f'交易金额：{amount}TRX\n'
+                        f'账户余额：{round(balance, 2)}TRX，{round(usdt_balance, 2)}USDT'
+                    )
+                    await self.client.send_message(chat_id, message, buttons=keyboard, parse_mode='markdown')
+                except Exception as e:
+                    logger.error(f"Error sending TRX transaction message to {chat_id}: {e}")
+
+        # 收款监听
+        if to_address in self.monitored_addresses:
+            energy_remaining, bandwidth_remaining, balance, usdt_balance = await self.get_account_info(to_address)
+            for chat_id in self.monitored_addresses[to_address]:
+                try:
+                    message = (
+                        f'✅*收入到账 +{amount}TRX*\n'
+                        f'付款地址：`{from_address}`\n'
+                        f'收款地址：`{to_address}`\n'
+                        f'交易时间：{formatted_date_time}\n'
+                        f'交易金额：{amount}TRX\n'
+                        f'账户余额：{round(balance, 2)}TRX，{round(usdt_balance, 2)}USDT'
+                    )
+                    await self.client.send_message(chat_id, message, buttons=keyboard, parse_mode='markdown')
+                except Exception as e:
+                    logger.error(f"Error sending TRX transaction message to {chat_id}: {e}")
+
+    async def refresh_monitored_addresses(self):
+        """定期刷新监听地址列表"""
+        while True:
+            try:
+                self.monitored_addresses = self.load_monitored_addresses()
+                logger.info("Refreshed monitored addresses")
+                await asyncio.sleep(300)  # 每5分钟刷新一次
+            except Exception as e:
+                logger.error(f"Error refreshing monitored addresses: {e}")
+                await asyncio.sleep(60)
+
+    async def start_monitoring(self):
+        """开始监控"""
+        await self.client.start(bot_token=self.bot_token)
+        logger.info("Wallet monitor started")
+        
+        # 设置命令处理器
+        await self.setup_handlers()
+        
+        # 启动地址刷新任务
+        asyncio.create_task(self.refresh_monitored_addresses())
+        
+        # 启动区块监控
+        while True:
+            try:
+                current_block = await self.get_latest_block()
+                if current_block:
+                    await self.monitor_transaction(current_block)
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.error(f"Error in monitoring loop: {e}")
+                await asyncio.sleep(5)
+
+    async def get_latest_block(self):
+        """获取最新区块"""
+        url = 'https://api.trongrid.io/wallet/getblockbynum'
+        headers = {
+            'Content-Type': 'application/json',
+            'TRON-PRO-API-KEY': self.tron_api_key
+        }
+        try:
+            current_block = self.tron.trx.get_current_block()
+            block_number = current_block['block_header']['raw_data']['number']
+            
+            data = {'num': block_number}
+            async with self.client.session.post(url, headers=headers, json=data) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    logger.error(f"Error getting block: {await response.text()}")
+                    return None
+        except Exception as e:
+            logger.error(f"Error getting latest block: {e}")
+            return None
+
+    async def add_address(self, chat_id: int, address: str):
+        """添加监听地址"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if not self.tron.isAddress(address):
+            return False, "无效的TRX地址"
+        
+        if address not in self.monitored_addresses:
+            self.monitored_addresses[address] = []
+        
+        if chat_id in self.monitored_addresses[address]:
+            return False, "该地址已在监听列表中"
+        
+        self.monitored_addresses[address].append(chat_id)
+        
+        with open('监听.txt', 'a', encoding='utf-8') as f:
+            f.write(f"{timestamp} - chat_id: {chat_id} - 地址: {address}\n")
+        
+        return True, "地址添加成功"
+
+    async def remove_address(self, chat_id: int, address: str):
+        """移除监听地址"""
+        if address not in self.monitored_addresses or chat_id not in self.monitored_addresses[address]:
+            return False, "该地址不在监听列表中"
+        
+        self.monitored_addresses[address].remove(chat_id)
+        if not self.monitored_addresses[address]:
+            del self.monitored_addresses[address]
+        
+        # 更新文件
+        with open('监听.txt', 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        with open('监听.txt', 'w', encoding='utf-8') as f:
+            for line in lines:
+                if f"chat_id: {chat_id}" not in line or f"地址: {address}" not in line:
+                    f.write(line)
+                
+        return True, "地址移除成功"
+
+    async def reload_config(self):
+        """重新加载配置"""
+        try:
+            with open('config.txt', 'r') as f:
+                config = dict(line.strip().split('=') for line in f if line.strip())
+            
+            self.tron_api_key = config['TRON_API_KEY']
+            self.control_address = config['control_address']
+            self.bot_username = config['bot_id']
+            self.customer_service_id = config['CUSTOMER_SERVICE_ID']
+            self.group_link = config['group_link']
+            
+            return True, "配置重载成功"
+        except Exception as e:
+            logger.error(f"Error reloading config: {e}")
+            return False, f"配置重载失败: {str(e)}"
+
+    async def setup_handlers(self):
+        """设置命令处理器"""
+        @self.client.on(events.NewMessage(pattern='/start'))
+        async def start_handler(event):
+            await event.respond("欢迎使用钱包监控机器人!\n"
+                              "使用 /help 查看帮助信息")
+
+        @self.client.on(events.NewMessage(pattern='/help'))
+        async def help_handler(event):
+            help_text = (
+                "📋 命令列表:\n"
+                "/start - 开始使用\n"
+                "/help - 显示帮助信息\n"
+                "开始监听 地址 - 添加监听地址\n"
+                "结束监听 地址 - 删除监听地址\n"
+                "已监听地址 - 查看当前监听的地址"
+            )
+            await event.respond(help_text)
+
+        @self.client.on(events.NewMessage(pattern=r'开始监听\s+([A-Za-z0-9]+)'))
+        async def add_address_handler(event):
+            address = event.pattern_match.group(1)
+            chat_id = event.chat_id
+            success, message = await self.add_address(chat_id, address)
+            await event.respond(message)
+
+        @self.client.on(events.NewMessage(pattern=r'结束监听\s+([A-Za-z0-9]+)'))
+        async def remove_address_handler(event):
+            address = event.pattern_match.group(1)
+            chat_id = event.chat_id
+            success, message = await self.remove_address(chat_id, address)
+            await event.respond(message)
+
+        @self.client.on(events.NewMessage(pattern='已监听地址'))
+        async def list_addresses_handler(event):
+            chat_id = event.chat_id
+            addresses = [addr for addr, users in self.monitored_addresses.items() 
+                        if chat_id in users]
+            if addresses:
+                message = "当前监听的地址:\n" + "\n".join(f"`{addr}`" for addr in addresses)
+            else:
+                message = "当前没有监听任何地址"
+            await event.respond(message, parse_mode='markdown')
+
+    async def shutdown(self):
+        """优雅关闭"""
+        logger.info("Shutting down wallet monitor...")
+        # 关闭 Telegram 客户端
+        await self.client.disconnect()
+        logger.info("Wallet monitor shutdown complete")
+
+async def main():
+    monitor = None
+    try:
+        # 从配置文件读取配置
+        with open('config.txt', 'r') as f:
+            config = dict(line.strip().split('=') for line in f if line.strip())
+        
+        monitor = WalletMonitor(
+            api_id=config['API_ID'],
+            api_hash=config['API_HASH'],
+            bot_token=config['TOKEN'],
+            tron_api_key=config['TRON_API_KEY'],
+            control_address=config['control_address'],
+            bot_username=config['bot_id'],
+            customer_service_id=config['CUSTOMER_SERVICE_ID'],
+            group_link=config['group_link']
+        )
+        
+        await monitor.start_monitoring()
+    except KeyboardInterrupt:
+        logger.info("Received shutdown signal")
+    finally:
+        if monitor:
+            await monitor.shutdown()
+
+if __name__ == '__main__':
+    asyncio.run(main()) 
