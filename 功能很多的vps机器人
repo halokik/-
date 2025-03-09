@@ -1,0 +1,1130 @@
+from telethon import TelegramClient, events, Button
+import psutil
+import os
+import asyncio
+from datetime import datetime
+import pathlib
+from typing import Dict
+import subprocess
+import json
+
+# 配置信息
+API_ID = 21332425
+API_HASH = 'f5d0cddc784e3a7a09ea9714ed01f238'
+BOT_TOKEN = '7258082736:AAEof4V0c7vGL5ZlOboQ-PKjZCuftB4Dzag'
+
+# 允许使用机器人的用户ID列表
+ALLOWED_USERS = [5179399961,6279591488]
+
+# 添加状态管理
+class UserState:
+    def __init__(self):
+        self.waiting_mkdir = False
+        self.waiting_mkfile = False  # 添加创建文件状态
+        self.waiting_edit = False
+        self.waiting_proxy = False  # 添加反代状态
+        self.proxy_step = None  # 记录反代配置步骤
+        self.proxy_data = {}  # 存储反代配置数据
+        self.current_path = None
+        self.edit_file_path = None  # 用于存储正在编辑的文件路径
+        self.docker_operation = None  # 记录当前的 docker 操作
+
+# 在全局变量部分添加
+user_states: Dict[int, UserState] = {}
+
+# 初始化机器人
+bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+
+async def refresh_directory_view(event, current_path):
+    """刷新目录视图的辅助函数"""
+    try:
+        buttons = []
+        path_obj = pathlib.Path(current_path)
+        items = list(path_obj.iterdir())
+        
+        # 分类文件和目录
+        directories = [item for item in items if item.is_dir()]
+        files = [item for item in items if item.is_file()]
+        
+        # 限制显示数量
+        MAX_ITEMS = 30  # 每页最多显示30个项目
+        total_dirs = len(directories)
+        total_files = len(files)
+        
+        if total_dirs + total_files > MAX_ITEMS:
+            # 添加提示信息
+            buttons.append([Button.inline(f'⚠️ 目录内容过多 (共{total_dirs}个目录, {total_files}个文件)', 'noop')])
+            # 只显示前15个目录和前15个文件
+            directories = directories[:15]
+            files = files[:15]
+        
+        # 添加目录按钮
+        dir_buttons = []
+        for directory in directories:
+            dir_buttons.append(Button.inline(f'📁 {directory.name}', f'cd:{directory}'))
+            if len(dir_buttons) == 3:
+                buttons.append(dir_buttons)
+                dir_buttons = []
+        if dir_buttons:
+            buttons.append(dir_buttons)
+        
+        # 添加文件按钮 
+        file_buttons = []
+        for file in files:
+            file_buttons.append(Button.inline(f'📄 {file.name}', f'file:{file}'))
+            if len(file_buttons) == 3:
+                buttons.append(file_buttons)
+                file_buttons = []
+        if file_buttons:
+            buttons.append(file_buttons)
+        
+        # 添加分割线
+        buttons.append([Button.inline('  ─── ───操作菜单 ─── ─── ', 'noop')])
+        
+        # 只在根目录显示系统状态和进程按钮
+        if str(path_obj) == '/':
+            system_buttons = [
+                [Button.inline('💾 查看磁盘使用情况', 'disk')],
+                [Button.inline('🔄 运行中的程序', 'running_py')],
+                [
+                    Button.inline('🌐 反向代理', 'proxy'),
+                    Button.inline('🚀 快速测试', 'quick_test')
+                ],
+                [Button.inline('🐳 Docker管理', 'docker')],
+                [Button.inline('⚡️ 服务器测速', 'speed_test')]
+            ]
+            buttons.extend(system_buttons)  # 使用extend而不是append来添加多行按钮
+        
+        # 添加操作按钮
+        operation_buttons = []
+        # 只在非根目录显示删除文件夹按钮
+        if str(path_obj) != '/':
+            operation_buttons.append(Button.inline('🗑 删除文件夹', f'rmdir:{current_path}'))
+        operation_buttons.append(Button.inline('➕ 创建文件夹', f'mkdir:{current_path}'))
+        operation_buttons.append(Button.inline('📝 创建文件', f'mkfile:{current_path}'))
+        buttons.append(operation_buttons)
+        
+        # 添加返回上级按钮
+        if str(path_obj) != '/':
+            buttons.append([Button.inline('📂 ..', f'cd:{path_obj.parent}')])
+            
+        return buttons
+        
+    except Exception as e:
+        print(f"生成目录视图时发生错误: {str(e)}")
+        raise
+
+@bot.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    """启动命令处理器"""
+    if event.sender_id not in ALLOWED_USERS:
+        await event.respond('抱歉，您没有使用此机器人的权限。')
+        return
+    
+    # 直接显示文件浏览器内容，使用 edit=False
+    await list_directory(event, path='/', edit=False)
+
+@bot.on(events.CallbackQuery(pattern='disk'))
+async def disk_usage(event):
+    """获取磁盘使用情况"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    cpu = psutil.cpu_percent()
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    uptime = datetime.now() - datetime.fromtimestamp(psutil.boot_time())
+    
+    status_msg = (
+        f'📊 服务器状态:\n\n'
+        f'CPU使用率: {cpu}%\n'
+        f'内存使用: {memory.percent}%\n'
+        f'磁盘使用: {disk.percent}%\n'
+        f'运行时间: {uptime}'
+    )
+    
+    # 修改返回按钮，直接返回到文件浏览器
+    buttons = [[Button.inline('📂 返回文件浏览器', 'ls')]]
+    await event.edit(status_msg, buttons=buttons)
+
+@bot.on(events.CallbackQuery(pattern='ls'))
+async def list_directory(event, path=None, edit=True):
+    """列出目录内容"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    current_path = path or '/'
+    
+    try:
+        buttons = await refresh_directory_view(event, current_path)
+        if edit:
+            await event.edit(f'📂 当前目录: {current_path}', buttons=buttons)
+        else:
+            await event.respond(f'📂 当前目录: {current_path}', buttons=buttons)
+    except Exception as e:
+        print(f"列出目录时发生错误: {str(e)}")
+        if edit:
+            await event.edit(f'❌ 错误: {str(e)}')
+        else:
+            await event.respond(f'❌ 错误: {str(e)}')
+
+@bot.on(events.CallbackQuery(pattern=r'cd:(.+)'))
+async def change_directory(event):
+    """切换目录"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    path = event.pattern_match.group(1).decode()
+    try:
+        if not pathlib.Path(path).exists():
+            await event.answer('❌ 目录不存在')
+            return
+        
+        await list_directory(event, path=path)
+        await event.answer()
+    except Exception as e:
+        print(f"切换目录时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}')
+
+@bot.on(events.CallbackQuery(pattern=r'file:(.+)'))
+async def file_info(event):
+    """显示文件选项"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    file_path = event.pattern_match.group(1).decode()
+    path = pathlib.Path(file_path)
+    
+    try:
+        buttons = [
+            [
+                Button.inline('📝 查看文件信息', f'info:{file_path}'),
+                Button.inline('👀 查看文件内容', f'view:{file_path}'),
+                Button.inline('✏️ 编辑文件', f'edit:{file_path}')
+            ],
+            [Button.inline('🗑️ 删除文件', f'rmfile:{file_path}')]
+        ]
+        
+        # 如果是 Python 文件，添加运行按钮
+        if path.suffix == '.py':
+            buttons.append([Button.inline('▶️ 在后台运行', f'run:{file_path}')])
+            
+        buttons.append([Button.inline('🚫 取消', 'cancel')])
+        
+        await event.respond(
+            f'📄 文件: {path.name}\n'
+            f'请选择操作:',
+            buttons=buttons
+        )
+        await event.answer()
+    except Exception as e:
+        print(f"显示文件选项时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+@bot.on(events.CallbackQuery(pattern=r'info:(.+)'))
+async def show_file_info(event):
+    """显示文件详细信息"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    file_path = event.pattern_match.group(1).decode()
+    try:
+        path = pathlib.Path(file_path)
+        stats = path.stat()
+        
+        info = (
+            f'📄 文件信息:\n\n'
+            f'名称: {path.name}\n'
+            f'大小: {stats.st_size / 1024:.2f} KB\n'
+            f'创建时间: {datetime.fromtimestamp(stats.st_birthtime)}\n'
+            f'修改时间: {datetime.fromtimestamp(stats.st_mtime)}\n'
+            f'权限: {oct(stats.st_mode)[-3:]}'
+        )
+        await event.answer(info, alert=True)
+    except Exception as e:
+        print(f"获取文件信息时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+@bot.on(events.CallbackQuery(pattern=r'view:(.+)'))
+async def view_file_content(event):
+    """查看文件内容"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    file_path = event.pattern_match.group(1).decode()
+    try:
+        path = pathlib.Path(file_path)
+        
+        # 检查文件大小
+        if path.stat().st_size > 1024 * 1024:  # 大于1MB
+            await event.answer('❌ 文件太大，无法显示内容', alert=True)
+            return
+            
+        # 尝试读取文件内容
+        try:
+            content = path.read_text(encoding='utf-8')
+            # 如果内容太长，只显示前2000个字符
+            if len(content) > 2000:
+                content = content[:2000] + '\n... (内容已截断)'
+        except UnicodeDecodeError:
+            await event.answer('❌ 无法读取文件内容（可能是二进制文件）', alert=True)
+            return
+            
+        buttons = [[Button.inline('🚫 取消', 'cancel')]]
+        await event.respond(  # 改用 respond 而不是 edit
+            f'📄 {path.name} 的内容:\n\n'
+            f'```\n{content}\n```',
+            buttons=buttons
+        )
+        await event.answer()
+    except Exception as e:
+        print(f"查看文件内容时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+# 修改取消按钮的处理函数
+@bot.on(events.CallbackQuery(pattern='cancel'))
+async def cancel_operation(event):
+    """取消当前操作"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    try:
+        # 重置用户状态
+        if event.sender_id in user_states:
+            user_state = user_states[event.sender_id]
+            # 重置所有状态
+            user_state.waiting_mkdir = False
+            user_state.waiting_mkfile = False
+            user_state.waiting_edit = False
+            user_state.waiting_proxy = False  # 添加反代状态重置
+            user_state.proxy_step = None      # 重置反代步骤
+            user_state.proxy_data = {}        # 清空反代数据
+            user_state.current_path = None
+            user_state.edit_file_path = None
+        
+        await event.delete()  # 删除消息
+    except Exception as e:
+        print(f"取消操作时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+@bot.on(events.CallbackQuery(pattern='back'))
+async def back_to_menu(event):
+    """返回文件浏览器"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    # 直接调用 list_directory 显示文件浏览器
+    await list_directory(event, path='/')
+
+# 添加创建文件夹的处理函数
+@bot.on(events.CallbackQuery(pattern=r'mkdir:(.+)'))
+async def mkdir_start(event):
+    """开始创建文件夹流程"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    path = event.pattern_match.group(1).decode()
+    
+    # 保存用户状态
+    if event.sender_id not in user_states:
+        user_states[event.sender_id] = UserState()
+    user_states[event.sender_id].waiting_mkdir = True
+    user_states[event.sender_id].current_path = path
+    
+    buttons = [[Button.inline('🚫 取消', 'cancel')]]
+    await event.respond('请输入新文件夹的名称:', buttons=buttons)
+    await event.answer()
+
+# 处理反向代理配置的消息
+async def handle_proxy_message(event, user_state):
+    """处理反向代理配置的消息"""
+    text = event.text.strip()
+    
+    if user_state.proxy_step == 'domain':
+        if not text:
+            await event.respond('❌ 域名不能为空，请重新输入:')
+            return
+        user_state.proxy_data['domain'] = text
+        user_state.proxy_step = 'target_ip'
+        await event.respond('请输入目标IP:')
+        
+    elif user_state.proxy_step == 'target_ip':
+        if not text:
+            await event.respond('❌ 目标IP不能为空，请重新输入:')
+            return
+        user_state.proxy_data['target_ip'] = text
+        user_state.proxy_step = 'target_port'
+        await event.respond('请输入目标端口:')
+        
+    elif user_state.proxy_step == 'target_port':
+        await handle_proxy_config(event, user_state, text)
+
+async def handle_proxy_config(event, user_state, port):
+    """处理反向代理的配置"""
+    if not port.isdigit():
+        await event.respond('❌ 端口必须是数字，请重新输入:')
+        return
+        
+    user_state.proxy_data['target_port'] = port
+    
+    try:
+        await setup_proxy_config(event, user_state.proxy_data)
+    except Exception as e:
+        await event.respond(f'❌ 配置失败: {str(e)}')
+    finally:
+        # 重置状态
+        user_state.waiting_proxy = False
+        user_state.proxy_step = None
+        user_state.proxy_data = {}
+
+async def setup_proxy_config(event, proxy_data):
+    """设置反向代理配置"""
+    try:
+        # 检查 Docker 是否已安装
+        docker_check = subprocess.run(['which', 'docker'], capture_output=True, text=True)
+        if not docker_check.stdout.strip():
+            # Docker 未安装，尝试安装
+            await event.respond('正在安装 Docker...')
+            subprocess.run(['curl', '-fsSL', 'https://get.docker.com', '-o', 'get-docker.sh'])
+            subprocess.run(['sh', 'get-docker.sh'])
+            subprocess.run(['systemctl', 'start', 'docker'])
+            subprocess.run(['systemctl', 'enable', 'docker'])
+        
+        # 检查 nginx 容器是否存在，如果存在则删除重建
+        nginx_check = subprocess.run(['docker', 'ps', '-a', '--filter', 'name=nginx'], capture_output=True, text=True)
+        if 'nginx' in nginx_check.stdout:
+            await event.respond('正在重建 Nginx 容器...')
+            subprocess.run(['docker', 'rm', '-f', 'nginx'])
+        
+        # 创建配置目录
+        os.makedirs('/home/web/conf.d', exist_ok=True)
+        
+        # 创建简单的 HTTP 配置
+        config_content = f'''
+server {{
+    listen 80;
+    listen [::]:80;
+    server_name {proxy_data["domain"]};
+    
+    location / {{
+        proxy_pass http://{proxy_data["target_ip"]}:{proxy_data["target_port"]};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }}
+}}
+'''
+        # 写入配置文件
+        with open(f'/home/web/conf.d/{proxy_data["domain"]}.conf', 'w') as f:
+            f.write(config_content)
+        
+        # 创建新的 nginx 容器
+        await event.respond('正在创建 Nginx 容器...')
+        subprocess.run([
+            'docker', 'run', '-d',
+            '--name', 'nginx',
+            '--restart', 'always',
+            '-p', '80:80',
+            '-v', '/home/web/conf.d:/etc/nginx/conf.d',
+            'nginx'
+        ])
+        
+        # 等待容器启动
+        await asyncio.sleep(2)
+        
+        # 检查 nginx 状态
+        nginx_logs = subprocess.run(['docker', 'logs', 'nginx'], capture_output=True, text=True)
+        await event.respond(f"Nginx 日志:\n{nginx_logs.stdout}\n{nginx_logs.stderr}")
+        
+        # 获取IP地址并发送成功消息
+        await send_proxy_success_message(event, proxy_data)
+        
+        await event.respond(
+            "⚠️ 注意：\n"
+            "1. 当前仅配置了 HTTP 访问\n"
+            "2. 如需 HTTPS，请手动配置 SSL 证书\n"
+            "3. 如果无法访问，请检查：\n"
+            "   - 域名解析是否生效\n"
+            "   - 目标服务器是否正常运行\n"
+            "   - 防火墙是否允许 80 端口访问"
+        )
+        
+    except Exception as e:
+        raise Exception(f"配置失败: {str(e)}\n请确保系统已安装 Docker 并且有权限执行")
+
+async def send_proxy_success_message(event, proxy_data):
+    """发送反向代理配置成功消息"""
+    ipv4 = subprocess.run(['curl', '-s', 'ipv4.ip.sb'], capture_output=True, text=True).stdout.strip()
+    ipv6 = subprocess.run(['curl', '-s', '--max-time', '1', 'ipv6.ip.sb'], capture_output=True, text=True).stdout.strip()
+    
+    success_msg = '✅ 反向代理配置完成!\n\n访问地址:\n'
+    if ipv4:
+        success_msg += f'http://{ipv4}:{proxy_data["target_port"]}\n'
+    if ipv6:
+        success_msg += f'http://[{ipv6}]:{proxy_data["target_port"]}\n'
+    success_msg += f'https://{proxy_data["domain"]}'
+    
+    await event.respond(success_msg)
+
+# 处理文件夹创建的消息
+async def handle_mkdir_message(event, user_state):
+    """处理创建文件夹的消息"""
+    new_folder_name = event.text.strip()
+    new_folder_path = pathlib.Path(user_state.current_path) / new_folder_name
+    new_folder_path.mkdir(exist_ok=True)
+    
+    buttons = await refresh_directory_view(event, user_state.current_path)
+    await event.respond(
+        f'✅ 文件夹 "{new_folder_name}" 创建成功!\n'
+        f'📂 当前目录: {user_state.current_path}',
+        buttons=buttons
+    )
+
+# 处理文件创建的消息
+async def handle_mkfile_message(event, user_state):
+    """处理创建文件的消息"""
+    new_file_name = event.text.strip()
+    new_file_path = pathlib.Path(user_state.current_path) / new_file_name
+    new_file_path.touch()
+    
+    buttons = await refresh_directory_view(event, user_state.current_path)
+    await event.respond(
+        f'✅ 文件 "{new_file_name}" 创建成功!\n'
+        f'📂 当前目录: {user_state.current_path}',
+        buttons=buttons
+    )
+
+# 处理文件编辑的消息
+async def handle_edit_message(event, user_state):
+    """处理编辑文件的消息"""
+    new_content = event.text
+    path = pathlib.Path(user_state.edit_file_path)
+    path.write_text(new_content, encoding='utf-8')
+    
+    # 获取文件所在目录
+    current_path = str(path.parent)
+    buttons = await refresh_directory_view(event, current_path)
+    await event.respond(
+        f'✅ 文件 "{path.name}" 已更新!\n'
+        f'📂 当前目录: {current_path}',
+        buttons=buttons
+    )
+
+# 主消息处理函数
+@bot.on(events.NewMessage())
+async def handle_new_message(event):
+    """处理新消息"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+        
+    user_state = user_states.get(event.sender_id)
+    if not user_state:
+        return
+        
+    try:
+        if user_state.waiting_proxy:
+            await handle_proxy_message(event, user_state)
+        elif user_state.waiting_mkdir:
+            await handle_mkdir_message(event, user_state)
+        elif user_state.waiting_mkfile:
+            await handle_mkfile_message(event, user_state)
+        elif user_state.waiting_edit:
+            await handle_edit_message(event, user_state)
+            
+    except Exception as e:
+        await event.respond(f'❌ 操作失败: {str(e)}')
+    finally:
+        if not user_state.waiting_proxy:  # 只在非反代状态时重置其他状态
+            user_state.waiting_mkdir = False
+            user_state.waiting_mkfile = False 
+            user_state.waiting_edit = False
+            user_state.current_path = None
+            user_state.edit_file_path = None
+
+# 添加删除文件夹的处理函数
+@bot.on(events.CallbackQuery(pattern=r'rmdir:(.+)'))
+async def rmdir_confirm(event):
+    """确认删除文件夹"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    path = event.pattern_match.group(1).decode()
+    path_obj = pathlib.Path(path)
+    
+    try:
+        buttons = [
+            [
+                Button.inline('✅ 确认删除', f'rmdir_do:{path}'),
+                Button.inline('❌ 取消', 'cancel')
+            ]
+        ]
+        
+        await event.respond(
+            f'⚠️ 确认要删除文件夹吗？\n'
+            f'📂 路径: {path}',
+            buttons=buttons
+        )
+        await event.answer()
+    except Exception as e:
+        print(f"确认删除文件夹时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+@bot.on(events.CallbackQuery(pattern=r'rmdir_do:(.+)'))
+async def rmdir_execute(event):
+    """执行删除文件夹操作"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    path = event.pattern_match.group(1).decode()
+    path_obj = pathlib.Path(path)
+    
+    try:
+        # 检查是否为目录
+        if not path_obj.is_dir():
+            await event.answer('❌ 这不是一个文件夹', alert=True)
+            return
+            
+        # 尝试删除目录
+        import shutil
+        shutil.rmtree(path_obj)
+        
+        # 获取父目录路径用于刷新显示
+        parent_path = str(path_obj.parent)
+        
+        # 删除确认消息
+        try:
+            await event.delete()
+        except:
+            pass  # 忽略删除消息可能出现的错误
+        
+        # 发送新消息而不是编辑
+        buttons = []
+        path_obj = pathlib.Path(parent_path)
+        
+        try:
+            items = list(path_obj.iterdir())
+            directories = [item for item in items if item.is_dir()]
+            files = [item for item in items if item.is_file()]
+            
+            # 添加目录按钮
+            dir_buttons = []
+            for directory in directories:
+                dir_buttons.append(Button.inline(f'📁 {directory.name}', f'cd:{directory}'))
+                if len(dir_buttons) == 3:
+                    buttons.append(dir_buttons)
+                    dir_buttons = []
+            if dir_buttons:
+                buttons.append(dir_buttons)
+            
+            # 添加文件按钮
+            file_buttons = []
+            for file in files:
+                file_buttons.append(Button.inline(f'📄 {file.name}', f'file:{file}'))
+                if len(file_buttons) == 3:
+                    buttons.append(file_buttons)
+                    file_buttons = []
+            if file_buttons:
+                buttons.append(file_buttons)
+            
+            # 添加底部操作按钮
+            bottom_buttons = []
+            bottom_buttons.append(Button.inline('🗑 删除文件夹', f'rmdir:{parent_path}'))
+            bottom_buttons.append(Button.inline('➕ 创建文件夹', f'mkdir:{parent_path}'))
+            buttons.append(bottom_buttons)
+            
+            # 添加返回上级目录按钮到底部
+            if str(path_obj) != '/':
+                buttons.append([Button.inline('📂 ..', f'cd:{path_obj.parent}')])
+            
+            await event.respond(
+                f'✅ 文件夹已删除\n\n'
+                f'📂 当前目录: {parent_path}',
+                buttons=buttons
+            )
+        except Exception as e:
+            print(f"刷新目录时发生错误: {str(e)}")
+            await event.respond(f'❌ 错误: {str(e)}')
+            
+    except Exception as e:
+        print(f"删除文件夹时发生错误: {str(e)}")
+        await event.answer(f'❌ 删除失败: {str(e)}', alert=True)
+
+# 添加编辑文件的处理函数
+@bot.on(events.CallbackQuery(pattern=r'edit:(.+)'))
+async def edit_file_start(event):
+    """开始编辑文件流程"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    file_path = event.pattern_match.group(1).decode()
+    path = pathlib.Path(file_path)
+    
+    try:
+        # 检查文件大小
+        if path.stat().st_size > 1024 * 1024:  # 大于1MB
+            await event.answer('❌ 文件太大，无法编辑', alert=True)
+            return
+            
+        # 尝试读取当前内容
+        try:
+            content = path.read_text(encoding='utf-8')
+            # 如果内容太长，只显示前2000个字符
+            if len(content) > 2000:
+                content = content[:2000] + '\n... (内容已截断，但编辑时将修改完整文件)'
+        except UnicodeDecodeError:
+            await event.answer('❌ 无法编辑二进制文件', alert=True)
+            return
+        
+        # 保存用户状态
+        if event.sender_id not in user_states:
+            user_states[event.sender_id] = UserState()
+        user_states[event.sender_id].waiting_edit = True
+        user_states[event.sender_id].edit_file_path = file_path
+        
+        buttons = [[Button.inline('🚫 取消', 'cancel')]]
+        await event.respond(
+            f'✏️ 正在编辑: {path.name}\n'
+            f'当前内容:\n'
+            f'```\n{content}\n```\n'
+            f'请发送新的文件内容:',
+            buttons=buttons
+        )
+        await event.answer()
+        
+    except Exception as e:
+        print(f"开始编辑文件时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+# 添加运行 Python 文件的处理函数
+@bot.on(events.CallbackQuery(pattern=r'run:(.+)'))
+async def run_python_file(event):
+    """在后台运行 Python 文件"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    file_path = event.pattern_match.group(1).decode()
+    path = pathlib.Path(file_path)
+    
+    try:
+        # 检查文件是否存在且是 Python 文件
+        if not path.exists() or path.suffix != '.py':
+            await event.answer('❌ 无效的 Python 文件', alert=True)
+            return
+        
+        # 使用 nohup 在后台运行 Python 文件
+        cmd = f'nohup python3 {path} > {path}.log 2>&1 &'
+        os.system(cmd)
+        
+        # 获取进程 ID
+        result = subprocess.run(['pgrep', '-f', f'python3 {path}'], capture_output=True, text=True)
+        pid = result.stdout.strip()
+        
+        await event.respond(
+            f'✅ 文件已在后台启动\n'
+            f'📄 文件: {path.name}\n'
+            f'📝 日志: {path}.log\n'
+            f'🔄 PID: {pid}'
+        )
+        await event.answer()
+        
+    except Exception as e:
+        print(f"运行 Python 文件时发生错误: {str(e)}")
+        await event.answer(f'❌ 运行失败: {str(e)}', alert=True)
+
+# 添加查看运行中的 Python 程序的处理函数
+@bot.on(events.CallbackQuery(pattern='running_py'))
+async def list_running_python(event):
+    """列出所有运行中的 Python 程序"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    try:
+        # 使用两个命令来获取进程信息
+        ps_cmd = ['ps', '-ef']
+        ps_result = subprocess.run(ps_cmd, capture_output=True, text=True)
+        
+        # 过滤并格式化进程信息
+        running_programs = []
+        for line in ps_result.stdout.strip().split('\n'):
+            if 'python3' in line and 'bot_session' not in line:  # 排除机器人进程
+                parts = line.split()
+                if len(parts) >= 8:
+                    pid = parts[1]
+                    cmd = ' '.join(parts[7:])
+                    if '.py' in cmd:  # 只显示运行 Python 文件的进程
+                        running_programs.append((pid, cmd))
+        
+        if running_programs:
+            # 为每个进程创建停止按钮
+            buttons = []
+            message = '🔄 运行中的 Python 程序:\n\n'
+            for pid, cmd in running_programs:
+                message += f'🔹 PID: {pid}\n📄 命令: {cmd}\n\n'
+                buttons.append([Button.inline(f'⏹️ 停止 PID: {pid}', f'kill:{pid}')])
+            
+            buttons.append([Button.inline('📂 返回文件浏览器', 'ls')])
+            await event.edit(message, buttons=buttons)
+        else:
+            buttons = [[Button.inline('📂 返回文件浏览器', 'ls')]]
+            await event.edit('📝 当前没有运行中的 Python 程序', buttons=buttons)
+            
+    except Exception as e:
+        print(f"获取运行中的 Python 程序时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+# 添加停止进程的处理函数
+@bot.on(events.CallbackQuery(pattern=r'kill:(\d+)'))
+async def kill_process(event):
+    """停止指定的进程"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    pid = event.pattern_match.group(1)
+    try:
+        import signal
+        os.kill(int(pid), signal.SIGTERM)
+        await event.answer(f'✅ 进程 {pid} 已停止')
+        # 刷新进程列表
+        await list_running_python(event)
+    except ProcessLookupError:
+        await event.answer(f'❌ 进程 {pid} 不存在', alert=True)
+    except Exception as e:
+        print(f"停止进程时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+# 添加删除文件的处理函数
+@bot.on(events.CallbackQuery(pattern=r'rmfile:(.+)'))
+async def rmfile_confirm(event):
+    """确认删除文件"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    file_path = event.pattern_match.group(1).decode()
+    path = pathlib.Path(file_path)
+    
+    try:
+        buttons = [
+            [
+                Button.inline('✅ 确认删除', f'rmfile_do:{file_path}'),
+                Button.inline('❌ 取消', 'cancel')
+            ]
+        ]
+        
+        await event.respond(
+            f'⚠️ 确认要删除文件吗？\n'
+            f'📄 文件: {path.name}',
+            buttons=buttons
+        )
+        await event.answer()
+    except Exception as e:
+        print(f"确认删除文件时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+@bot.on(events.CallbackQuery(pattern=r'rmfile_do:(.+)'))
+async def rmfile_execute(event):
+    """执行删除文件操作"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    file_path = event.pattern_match.group(1).decode()
+    path = pathlib.Path(file_path)
+    
+    try:
+        # 检查是否为文件
+        if not path.is_file():
+            await event.answer('❌ 这不是一个文件', alert=True)
+            return
+            
+        # 删除文件
+        path.unlink()
+        
+        # 获取父目录路径用于刷新显示
+        parent_path = str(path.parent)
+        
+        # 删除确认消息
+        try:
+            await event.delete()
+        except:
+            pass  # 忽略删除消息可能出现的  误
+        
+        # 刷新目录显示
+        await list_directory(event, path=parent_path)
+        await event.answer('✅ 文件已删除')
+        
+    except Exception as e:
+        print(f"删除文件时发生错误: {str(e)}")
+        await event.answer(f'❌ 删除失败: {str(e)}', alert=True)
+
+# 添加创建文件的处理函数
+@bot.on(events.CallbackQuery(pattern=r'mkfile:(.+)'))
+async def mkfile_start(event):
+    """开始创建文件流程"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    path = event.pattern_match.group(1).decode()
+    
+    # 保存用户状态
+    if event.sender_id not in user_states:
+        user_states[event.sender_id] = UserState()
+    user_states[event.sender_id].waiting_mkfile = True
+    user_states[event.sender_id].current_path = path
+    
+    buttons = [[Button.inline('🚫 取消', 'cancel')]]
+    await event.respond('请输入新文件的名称:', buttons=buttons)
+    await event.answer()
+
+# 添加空操作的处理函数
+@bot.on(events.CallbackQuery(pattern='noop'))
+async def handle_noop(event):
+    """处理空操作按钮"""
+    await event.answer('此目录内容过多，仅显示部分内容')
+
+# 添加反代处理函数
+@bot.on(events.CallbackQuery(pattern='proxy'))
+async def proxy_start(event):
+    """开始反向代理配置"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    # 保存用户状态
+    if event.sender_id not in user_states:
+        user_states[event.sender_id] = UserState()
+    user_state = user_states[event.sender_id]
+    user_state.waiting_proxy = True
+    user_state.proxy_step = 'domain'  # 等待输入域名
+    
+    buttons = [[Button.inline('🚫 取消', 'cancel')]]
+    await event.respond('🌐 反向代理配置向导\n\n请输入域名:', buttons=buttons)
+
+# 添加快速测试处理函数
+@bot.on(events.CallbackQuery(pattern='quick_test'))
+async def quick_test(event):
+    """快速启动测试服务器"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    try:
+        # 检查并安装 Flask
+        try:
+            import flask
+        except ImportError:
+            await event.edit('正在安装必要的依赖...')
+            subprocess.run(['pip', 'install', 'flask'], check=True)
+        
+        # 检查测试服务器是否已运行
+        result = subprocess.run(['pgrep', '-f', 'test_server.py'], capture_output=True, text=True)
+        if result.stdout.strip():
+            await event.answer('❌ 测试服务器已在运行中', alert=True)
+            return
+        
+        # 启动测试服务器
+        subprocess.Popen(['python3', 'test_server.py'])
+        
+        # 获取IP地址
+        ipv4 = subprocess.run(['curl', '-s', 'ipv4.ip.sb'], capture_output=True, text=True).stdout.strip()
+        ipv6 = subprocess.run(['curl', '-s', '--max-time', '1', 'ipv6.ip.sb'], capture_output=True, text=True).stdout.strip()
+        
+        # 发送提示消息
+        msg = '✅ 测试服务器已启动!\n\n'
+        msg += '访问地址:\n'
+        if ipv4:
+            msg += f'http://{ipv4}:5000\n'
+        if ipv6:
+            msg += f'http://[{ipv6}]:5000\n'
+        msg += '\n可以通过以上地址测试域名解析。\n'
+        msg += '测试完成后，请在运行中的程序中停止 test_server.py'
+        
+        buttons = [[Button.inline('📂 返回文件浏览器', 'ls')]]
+        await event.edit(msg, buttons=buttons)
+        
+    except Exception as e:
+        print(f"启动测试服务器时发生错误: {str(e)}")
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+# 添加 Docker 管理功能
+@bot.on(events.CallbackQuery(pattern='docker'))
+async def docker_menu(event):
+    """显示 Docker 管理菜单"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    try:
+        # 获取容器列表
+        containers = subprocess.run(['docker', 'ps', '-a', '--format', '{{.Names}}\t{{.Status}}'], 
+                                 capture_output=True, text=True).stdout.strip()
+        
+        msg = '🐳 Docker 容器管理\n\n'
+        buttons = []
+        
+        if containers:
+            for container in containers.split('\n'):
+                if container:
+                    name, status = container.split('\t')
+                    status_icon = '🟢' if 'Up' in status else '🔴'
+                    buttons.append([Button.inline(f'{status_icon} {name}', f'docker_container:{name}')])
+        else:
+            msg += '没有发现容器'
+            
+        # 添加底部按钮
+        buttons.extend([
+            [Button.inline('🔄 刷新列表', 'docker')],
+            [Button.inline('📂 返回', 'ls')]
+        ])
+        
+        await event.edit(msg, buttons=buttons)
+    except Exception as e:
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+@bot.on(events.CallbackQuery(pattern=r'docker_container:(.+)'))
+async def docker_container_menu(event):
+    """显示容器操作菜单"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    container = event.pattern_match.group(1).decode()
+    
+    try:
+        # 获取容器状态
+        status = subprocess.run(['docker', 'ps', '-a', '--filter', f'name={container}', '--format', '{{.Status}}'],
+                              capture_output=True, text=True).stdout.strip()
+        
+        msg = f'🐳 容器: {container}\n状态: {status}\n\n选择操作:'
+        buttons = []
+        
+        # 根据容器状态显示不同的按钮
+        if 'Up' in status:
+            buttons.extend([
+                [Button.inline('⏹️ 停止', f'docker_stop:{container}'),
+                 Button.inline('🔄 重启', f'docker_restart:{container}')],
+                [Button.inline('📋 查看日志', f'docker_logs:{container}')]
+            ])
+        else:
+            buttons.append([Button.inline('▶️ 启动', f'docker_start:{container}')])
+            
+        buttons.extend([
+            [Button.inline('🗑️ 删除', f'docker_rm:{container}')],
+            [Button.inline('◀️ 返回', 'docker')]
+        ])
+        
+        await event.edit(msg, buttons=buttons)
+    except Exception as e:
+        await event.answer(f'❌ 错误: {str(e)}', alert=True)
+
+# 处理容器操作
+@bot.on(events.CallbackQuery(pattern=r'docker_(start|stop|restart|rm):(.+)'))
+async def docker_operation(event):
+    """执行容器操作"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    operation = event.pattern_match.group(1)
+    container = event.pattern_match.group(2).decode()
+    
+    operations = {
+        'start': ('启动', ['docker', 'start']),
+        'stop': ('停止', ['docker', 'stop']),
+        'restart': ('重启', ['docker', 'restart']),
+        'rm': ('删除', ['docker', 'rm', '-f'])
+    }
+    
+    try:
+        op_name, cmd = operations[operation]
+        cmd.append(container)
+        
+        # 执行操作
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            await event.answer(f'✅ {op_name}成功')
+        else:
+            await event.answer(f'❌ {op_name}失败: {result.stderr}', alert=True)
+            
+        # 返回容器列表
+        await docker_menu(event)
+    except Exception as e:
+        await event.answer(f'❌ 操作失败: {str(e)}', alert=True)
+
+@bot.on(events.CallbackQuery(pattern=r'docker_logs:(.+)'))
+async def docker_logs(event):
+    """查看容器日志"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    container = event.pattern_match.group(1).decode()
+    
+    try:
+        # 获取最后100行日志
+        logs = subprocess.run(['docker', 'logs', '--tail', '100', container], 
+                            capture_output=True, text=True).stdout.strip()
+        
+        msg = f'📋 {container} 的最新日志:\n\n```\n{logs[:4000]}\n```'  # 限制长度
+        if len(logs) > 4000:
+            msg += '\n... (日志已截断)'
+            
+        buttons = [[Button.inline('◀️ 返回', f'docker_container:{container}')]]
+        await event.edit(msg, buttons=buttons)
+    except Exception as e:
+        await event.answer(f'❌ 获取日志失败: {str(e)}', alert=True)
+
+# 添加测速相关的处理函数
+@bot.on(events.CallbackQuery(pattern='speed_test'))
+async def speed_test_menu(event):
+    """显示测速菜单"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    buttons = [
+        [Button.inline('▶️ 开始测速', 'start_speed_test')],
+        [Button.inline('📂 返回', 'ls')]
+    ]
+    
+    await event.edit('⚡️ 服务器测速\n\n选择操作:', buttons=buttons)
+
+@bot.on(events.CallbackQuery(pattern='start_speed_test'))
+async def start_speed_test(event):
+    """开始测速"""
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    
+    try:
+        msg = await event.edit('⏳ 正在进行测速...\n这可能需要几分钟时间')
+        
+        # 在后台运行测速脚本
+        process = await asyncio.create_subprocess_exec(
+            'python3', 'local_speed_test.py',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode == 0:
+            # 从输出中提取结果
+            output = stdout.decode()
+            msg_text = '📊 测速结果:\n\n'
+            
+            if '测速失败' in output:
+                msg_text += f'❌ {output}'
+            else:
+                for line in output.split('\n'):
+                    if any(x in line.lower() for x in ['延迟', '下载速度', '上传速度']):
+                        msg_text += f'{line}\n'
+        else:
+            msg_text = f'❌ 测速失败:\n{stderr.decode()}'
+        
+        buttons = [[Button.inline('🔄 重新测速', 'start_speed_test')],
+                  [Button.inline('📂 返回', 'ls')]]
+        await event.edit(msg_text, buttons=buttons)
+        
+    except Exception as e:
+        await event.edit(f'❌ 错误: {str(e)}')
+
+def main():
+    """启动机器人"""
+    print('机器人已启动...')
+    bot.run_until_disconnected()
+
+if __name__ == '__main__':
+    main()
